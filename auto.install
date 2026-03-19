@@ -788,15 +788,8 @@ _force_fq_qdisc() {
   modprobe sch_fq >/dev/null 2>&1 || true
 
   if tc qdisc show dev "$DEV" 2>/dev/null | grep -q '^qdisc mq '; then
-    mapfile -t PARENTS < <(tc qdisc show dev "$DEV" 2>/dev/null | awk '/ parent :/ {
-      for (i = 1; i <= NF; i++) if ($i == "parent") print $(i + 1)
-    }' | awk '!seen[$0]++')
-    if [ "${#PARENTS[@]}" -gt 0 ]; then
-      for parent in "${PARENTS[@]}"; do
-        tc qdisc replace dev "$DEV" parent "$parent" fq >/dev/null 2>&1 || true
-      done
-      return 0
-    fi
+    tc qdisc replace dev "$DEV" root mq >/dev/null 2>&1 || true
+    return 0
   fi
 
   tc qdisc replace dev "$DEV" root fq >/dev/null 2>&1 || true
