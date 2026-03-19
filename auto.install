@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="5.1.2-smart-auto"
+VERSION="5.2.0-smart-hw-deterministic"
 WORKDIR="/opt/live-relay-smart-auto"
 NIC_ENV_FILE="/etc/live-relay-smart-auto.env"
 NIC_HELPER="/usr/local/sbin/live-relay-smart-auto-apply.sh"
@@ -73,10 +73,9 @@ ensure_cmd() {
     ethtool) pkg_apt="ethtool"; pkg_rpm="ethtool"; pkg_pac="ethtool"; pkg_zypper="ethtool" ;;
     python3) pkg_apt="python3"; pkg_rpm="python3"; pkg_pac="python"; pkg_zypper="python3" ;;
     lscpu) pkg_apt="util-linux"; pkg_rpm="util-linux"; pkg_pac="util-linux"; pkg_zypper="util-linux" ;;
-    ip) pkg_apt="iproute2"; pkg_rpm="iproute"; pkg_pac="iproute2"; pkg_zypper="iproute2" ;;
-    tc) pkg_apt="iproute2"; pkg_rpm="iproute"; pkg_pac="iproute2"; pkg_zypper="iproute2" ;;
+    ip|tc) pkg_apt="iproute2"; pkg_rpm="iproute"; pkg_pac="iproute2"; pkg_zypper="iproute2" ;;
     modprobe) pkg_apt="kmod"; pkg_rpm="kmod"; pkg_pac="kmod"; pkg_zypper="kmod" ;;
-    awk|sed|grep|find|sort|cat) return 0 ;;
+    awk|sed|grep|find|sort|cat|tr|cut|head|tail) return 0 ;;
     *) return 0 ;;
   esac
 
@@ -107,6 +106,15 @@ append_if_supported() {
 mem_total_kb() { awk '/MemTotal:/ {print $2; exit}' /proc/meminfo; }
 mem_total_gb() { awk '/MemTotal:/ {printf "%d\n", int(($2 + 1048575) / 1048576)}' /proc/meminfo; }
 
+physical_core_count() {
+  ensure_cmd lscpu >/dev/null 2>&1 || true
+  if command -v lscpu >/dev/null 2>&1 && lscpu -p=CORE,SOCKET,ONLINE >/dev/null 2>&1; then
+    lscpu -p=CORE,SOCKET,ONLINE | awk -F, '!/^#/ && ($3 == "Y" || $3 == "1") { seen[$1 ":" $2] = 1 } END { print length(seen) + 0 }'
+    return 0
+  fi
+  awk '/^processor[[:space:]]*:/ { cpu=$3 } /^physical id[[:space:]]*:/ { pkg=$4 } /^core id[[:space:]]*:/ { core=$4; seen[pkg ":" core] = 1 } END { n = length(seen); if (n > 0) print n; else print 0 }' /proc/cpuinfo 2>/dev/null
+}
+
 current_cc_algo() { sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo cubic; }
 
 pick_cc_algo() {
@@ -118,7 +126,6 @@ pick_cc_algo() {
   modprobe tcp_bbr >/dev/null 2>&1 || true
   available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
   if echo " $available " | grep -q ' bbr '; then echo bbr; return 0; fi
-
   echo "$current"
 }
 
@@ -144,66 +151,96 @@ calc_conntrack_max() {
 
 calc_file_max() {
   local mem_gb=$(mem_total_gb)
-  if [ "$mem_gb" -ge 256 ]; then echo 16777216
-  elif [ "$mem_gb" -ge 64 ]; then echo 8388608
-  else echo 4194304
+  if [ "$mem_gb" -ge 256 ]; then echo 8388608
+  elif [ "$mem_gb" -ge 64 ]; then echo 4194304
+  else echo 2097152
   fi
 }
 
 calc_netdev_backlog() {
-  local speed="$1"
+  local speed="$1" phys="$2" base
   case "$speed" in
-    ''|*[!0-9]*) echo 131072 ;;
+    ''|*[!0-9]*) base=65536 ;;
     *)
-      if [ "$speed" -ge 100000 ]; then echo 524288
-      elif [ "$speed" -ge 40000 ]; then echo 393216
-      elif [ "$speed" -ge 10000 ]; then echo 262144
-      elif [ "$speed" -ge 2500 ]; then echo 131072
-      else echo 65536
+      if [ "$speed" -ge 100000 ]; then base=524288
+      elif [ "$speed" -ge 50000 ]; then base=393216
+      elif [ "$speed" -ge 25000 ]; then base=262144
+      elif [ "$speed" -ge 10000 ]; then base=131072
+      elif [ "$speed" -ge 5000 ]; then base=98304
+      elif [ "$speed" -ge 1000 ]; then base=65536
+      else base=32768
       fi
       ;;
   esac
+  case "$phys" in ''|*[!0-9]*) phys=0 ;; esac
+  if [ "$phys" -ge 64 ]; then base=$(( base * 2 ))
+  elif [ "$phys" -ge 32 ]; then base=$(( base + (base / 2) ))
+  elif [ "$phys" -ge 16 ]; then base=$(( base + (base / 4) ))
+  fi
+  [ "$base" -gt 1048576 ] && base=1048576
+  echo "$base"
 }
 
 calc_netdev_budget() {
-  local speed="$1"
+  local speed="$1" phys="$2" base
   case "$speed" in
-    ''|*[!0-9]*) echo 1000 ;;
+    ''|*[!0-9]*) base=900 ;;
     *)
-      if [ "$speed" -ge 100000 ]; then echo 2000
-      elif [ "$speed" -ge 25000 ]; then echo 1500
-      elif [ "$speed" -ge 10000 ]; then echo 1200
-      else echo 800
+      if [ "$speed" -ge 100000 ]; then base=2400
+      elif [ "$speed" -ge 50000 ]; then base=1800
+      elif [ "$speed" -ge 25000 ]; then base=1400
+      elif [ "$speed" -ge 10000 ]; then base=1100
+      elif [ "$speed" -ge 5000 ]; then base=900
+      elif [ "$speed" -ge 1000 ]; then base=700
+      else base=500
       fi
       ;;
   esac
+  case "$phys" in ''|*[!0-9]*) phys=0 ;; esac
+  if [ "$phys" -ge 64 ]; then base=$(( base + 400 ))
+  elif [ "$phys" -ge 32 ]; then base=$(( base + 200 ))
+  elif [ "$phys" -ge 16 ]; then base=$(( base + 100 ))
+  fi
+  echo "$base"
 }
 
 calc_netdev_budget_usecs() {
-  local speed="$1"
+  local speed="$1" phys="$2" base
   case "$speed" in
-    ''|*[!0-9]*) echo 12000 ;;
+    ''|*[!0-9]*) base=12000 ;;
     *)
-      if [ "$speed" -ge 100000 ]; then echo 20000
-      elif [ "$speed" -ge 25000 ]; then echo 15000
-      elif [ "$speed" -ge 10000 ]; then echo 12000
-      else echo 8000
+      if [ "$speed" -ge 100000 ]; then base=20000
+      elif [ "$speed" -ge 50000 ]; then base=16000
+      elif [ "$speed" -ge 25000 ]; then base=14000
+      elif [ "$speed" -ge 10000 ]; then base=12000
+      elif [ "$speed" -ge 5000 ]; then base=10000
+      elif [ "$speed" -ge 1000 ]; then base=8000
+      else base=6000
       fi
       ;;
   esac
+  case "$phys" in ''|*[!0-9]*) phys=0 ;; esac
+  if [ "$phys" -ge 64 ]; then base=$(( base + 4000 ))
+  elif [ "$phys" -ge 32 ]; then base=$(( base + 2000 ))
+  elif [ "$phys" -ge 16 ]; then base=$(( base + 1000 ))
+  fi
+  echo "$base"
 }
 
 calc_somaxconn() {
-  local mem_gb=$(mem_total_gb)
-  if [ "$mem_gb" -ge 64 ]; then echo 262144
-  else echo 131072
+  local mem_gb phys
+  mem_gb=$(mem_total_gb)
+  phys=$(physical_core_count)
+  case "$phys" in ''|*[!0-9]*) phys=1 ;; esac
+  if [ "$mem_gb" -ge 128 ] || [ "$phys" -ge 64 ]; then echo 262144
+  elif [ "$mem_gb" -ge 64 ] || [ "$phys" -ge 32 ]; then echo 131072
+  else echo 65535
   fi
 }
 
 write_limits() {
   mkdir -p "$(dirname "$LIMITS_FILE")" "$SYSTEMD_LIMIT_DIR"
-
-  # 修正：将 ulimit 限制回落到 Linux 默认的内核 fs.nr_open 极限内 (1048576)
+  # 严格锁定在内核默认天花板 1048576，彻底规避 Operation not permitted
   cat > "$LIMITS_FILE" <<'EOF_LIMITS'
 * soft nofile 1048576
 * hard nofile 1048576
@@ -236,32 +273,35 @@ detect_primary_speed() {
   fi
   if [ -n "$nic" ] && command -v ethtool >/dev/null 2>&1; then
     speed=$(ethtool "$nic" 2>/dev/null | awk -F': ' '/Speed:/ {gsub(/Mb\/s/,"",$2); if($2 ~ /^[0-9]+$/) print $2; exit}')
-    if [ -n "$speed" ]; then
-      echo "$speed"
-      return 0
-    fi
+    if [ -n "$speed" ]; then echo "$speed"; return 0; fi
   fi
   echo ""
 }
 
 write_smart_profile() {
-  local cc="$1" speed backlog budget budget_usecs somax filemax mem_gb
+  local cc="$1" speed backlog budget budget_usecs somax filemax mem_gb phys flow_table_len
   speed=$(detect_primary_speed)
-  backlog=$(calc_netdev_backlog "$speed")
-  budget=$(calc_netdev_budget "$speed")
-  budget_usecs=$(calc_netdev_budget_usecs "$speed")
+  phys=$(physical_core_count)
+  case "$phys" in ''|*[!0-9]*) phys=1 ;; esac
+  backlog=$(calc_netdev_backlog "$speed" "$phys")
+  budget=$(calc_netdev_budget "$speed" "$phys")
+  budget_usecs=$(calc_netdev_budget_usecs "$speed" "$phys")
   somax=$(calc_somaxconn)
   filemax=$(calc_file_max)
   mem_gb=$(mem_total_gb)
 
+  if [ "$phys" -ge 64 ]; then flow_table_len=32768
+  elif [ "$phys" -ge 32 ]; then flow_table_len=16384
+  else flow_table_len=8192
+  fi
+
   cat > "$SYSCTL_FILE" <<EOF_HEADER
 # =====================================================
 # Live Relay Smart Auto Tuner $VERSION
-# 自动按链路速率 / 真实核心数调优
+# 确定性硬件感知调度，消除盲猜瓶颈
 # =====================================================
 EOF_HEADER
 
-  # 内核默认启用 fq，配合网卡的 mq 会自动生成 mq + 多叶子 fq
   append_if_supported net.core.default_qdisc fq
   append_if_supported net.ipv4.tcp_congestion_control "$cc"
 
@@ -270,27 +310,27 @@ EOF_HEADER
   append_if_supported net.core.netdev_max_backlog "$backlog"
   append_if_supported net.core.netdev_budget "$budget"
   append_if_supported net.core.netdev_budget_usecs "$budget_usecs"
-  append_if_supported net.core.dev_weight 512
+  append_if_supported net.core.dev_weight 256
   append_if_supported net.core.dev_weight_rx_bias 2
   append_if_supported net.core.dev_weight_tx_bias 1
 
   append_if_supported fs.file-max "$filemax"
 
-  append_if_supported net.core.rmem_max 268435456
-  append_if_supported net.core.wmem_max 268435456
-  append_if_supported net.core.rmem_default 4194304
-  append_if_supported net.core.wmem_default 1048576
-  append_if_supported net.core.optmem_max 524288
+  append_if_supported net.core.rmem_max 134217728
+  append_if_supported net.core.wmem_max 134217728
+  append_if_supported net.core.rmem_default 2097152
+  append_if_supported net.core.wmem_default 524288
+  append_if_supported net.core.optmem_max 262144
 
-  append_if_supported net.ipv4.tcp_rmem "4096 524288 268435456"
-  append_if_supported net.ipv4.tcp_wmem "4096 262144 268435456"
-  append_if_supported net.ipv4.udp_rmem_min 1048576
-  append_if_supported net.ipv4.udp_wmem_min 1048576
+  append_if_supported net.ipv4.tcp_rmem "4096 262144 134217728"
+  append_if_supported net.ipv4.tcp_wmem "4096 131072 134217728"
+  append_if_supported net.ipv4.udp_rmem_min 524288
+  append_if_supported net.ipv4.udp_wmem_min 524288
 
   append_if_supported net.ipv4.tcp_mtu_probing 1
   append_if_supported net.ipv4.tcp_slow_start_after_idle 0
-  append_if_supported net.ipv4.tcp_limit_output_bytes 2097152
-  append_if_supported net.ipv4.tcp_notsent_lowat 262144
+  append_if_supported net.ipv4.tcp_limit_output_bytes 1048576
+  append_if_supported net.ipv4.tcp_notsent_lowat 131072
   append_if_supported net.ipv4.ip_local_port_range "10000 65535"
 
   append_if_supported net.ipv4.tcp_fin_timeout 10
@@ -301,12 +341,14 @@ EOF_HEADER
   append_if_supported vm.swappiness 1
   append_if_supported vm.overcommit_memory 1
   if [ "$mem_gb" -ge 128 ]; then
-    append_if_supported vm.dirty_background_bytes 536870912
-    append_if_supported vm.dirty_bytes 2147483648
-  else
     append_if_supported vm.dirty_background_bytes 268435456
     append_if_supported vm.dirty_bytes 1073741824
+  else
+    append_if_supported vm.dirty_background_bytes 134217728
+    append_if_supported vm.dirty_bytes 536870912
   fi
+
+  append_if_supported net.core.flow_limit_table_len "$flow_table_len"
 
   modprobe nf_conntrack >/dev/null 2>&1 || true
   if [ -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
@@ -335,7 +377,7 @@ apply_sysctl_file() {
 persist_state() {
   mkdir -p "$WORKDIR"
   cat > "$STATE_FILE" <<EOF_STATE
-PROFILE=smart-auto
+PROFILE=smart-hw-deterministic
 NIC=${1:-}
 UPDATED_AT=$(date +%F_%T)
 EOF_STATE
@@ -422,6 +464,10 @@ _get_current_combined() {
   ethtool -l "$DEV" 2>/dev/null | awk '/Current hardware settings:/ {sec=1; next} sec && /Combined:/ {print $2; exit}'
 }
 
+_get_current_rings() {
+  ethtool -g "$DEV" 2>/dev/null | awk '/Current hardware settings:/ {sec=1; next} sec && $1 == "RX:" {rx=$2} sec && $1 == "TX:" {tx=$2} END { if (rx == "") rx="unknown"; if (tx == "") tx="unknown"; printf "%s/%s\n", rx, tx }'
+}
+
 _get_topology_lists() {
   local nic_node use_ht
   nic_node=$(_get_nic_numa_node)
@@ -469,52 +515,93 @@ _load_topology() {
   done
 }
 
-_calc_auto_queue_base() {
-  local max_combined cpu_count target_q
-  max_combined=$(_get_max_combined)
-  cpu_count=$(nproc 2>/dev/null || echo 8)
+_build_worker_cpu_list() {
+  _load_topology
+  WORKER_CPUS=()
+  WORKER_PRIMARY_CPUS=()
 
-  target_q=$cpu_count
+  local primary_count total_primary target need_ht speed use_ht
+  primary_count="${#LOCAL_PRIMARY[@]}"
+  total_primary=$(( ${#LOCAL_PRIMARY[@]} + ${#REMOTE_PRIMARY[@]} ))
+  target="${WORKER_CPUS_TARGET:-auto}"
+  use_ht="${USE_HT:-auto}"
+  speed=$(_get_link_speed)
+
+  if [ "$primary_count" -eq 0 ] && [ "$total_primary" -gt 0 ]; then
+    LOCAL_PRIMARY=("${REMOTE_PRIMARY[@]}"); REMOTE_PRIMARY=()
+    LOCAL_SIBLING=("${REMOTE_SIBLING[@]}"); REMOTE_SIBLING=()
+    primary_count="${#LOCAL_PRIMARY[@]}"
+  fi
+
+  case "$target" in
+    auto|''|*[!0-9]*) target="$primary_count" ;;
+    all|max) target="$total_primary" ;;
+  esac
+  [ "$target" -lt 1 ] && target=1
+
+  for cpu in "${LOCAL_PRIMARY[@]}"; do
+    [ "${#WORKER_PRIMARY_CPUS[@]}" -ge "$target" ] && break
+    WORKER_PRIMARY_CPUS+=("$cpu")
+  done
+  if [ "${#WORKER_PRIMARY_CPUS[@]}" -lt "$target" ]; then
+    for cpu in "${REMOTE_PRIMARY[@]}"; do
+      [ "${#WORKER_PRIMARY_CPUS[@]}" -ge "$target" ] && break
+      WORKER_PRIMARY_CPUS+=("$cpu")
+    done
+  fi
+
+  WORKER_CPUS=("${WORKER_PRIMARY_CPUS[@]}")
+  need_ht=0
+  if [ "$use_ht" = "1" ]; then need_ht=1
+  elif [ "$use_ht" = "auto" ]; then
+    case "$speed" in ''|*[!0-9]*) speed=0 ;; esac
+    if [ "$speed" -ge 40000 ] || [ "${#WORKER_PRIMARY_CPUS[@]}" -lt 8 ]; then need_ht=1; fi
+  fi
+
+  if [ "$need_ht" -eq 1 ]; then
+    for cpu in "${LOCAL_SIBLING[@]}"; do WORKER_CPUS+=("$cpu"); done
+    for cpu in "${REMOTE_SIBLING[@]}"; do WORKER_CPUS+=("$cpu"); done
+  fi
+
+  if [ "${#WORKER_CPUS[@]}" -eq 0 ]; then
+    mapfile -t WORKER_CPUS < <(_expand_cpulist "$(cat /sys/devices/system/cpu/online)")
+    WORKER_PRIMARY_CPUS=("${WORKER_CPUS[@]}")
+  fi
+}
+
+_calc_auto_queue_base() {
+  local max_combined worker_phys target_q
+  max_combined=$(_get_max_combined)
+  worker_phys="${#WORKER_PRIMARY_CPUS[@]}"
+  
+  # 绝对确定性：直接将队列映射到可用物理核上限，不再受流量探测影响
+  target_q=$worker_phys
+  [ "$target_q" -eq 0 ] && target_q=$(nproc 2>/dev/null || echo 8)
 
   if [ -n "$max_combined" ] && [ "$max_combined" != "n/a" ] && [ "$max_combined" -gt 0 ]; then
     [ "$target_q" -gt "$max_combined" ] && target_q="$max_combined"
   fi
 
+  [ "$target_q" -lt 1 ] && target_q=1
   echo "$target_q"
 }
 
 _pick_target_queues() {
   local target
   target=$(_calc_auto_queue_base)
-  [ "$target" -lt 1 ] && target=1
   echo "$target"
 }
 
-_build_cpu_list() {
+_build_irq_cpu_list() {
   local target="$1"
-  _load_topology
-  SELECTED_CPUS=()
-  for cpu in "${LOCAL_PRIMARY[@]}"; do
-    [ "${#SELECTED_CPUS[@]}" -ge "$target" ] && break
-    SELECTED_CPUS+=("$cpu")
+  IRQ_CPUS=()
+  local cpu
+  for cpu in "${WORKER_CPUS[@]}"; do
+    [ "${#IRQ_CPUS[@]}" -ge "$target" ] && break
+    IRQ_CPUS+=("$cpu")
   done
-  if [ "${#SELECTED_CPUS[@]}" -lt "$target" ]; then
-    for cpu in "${LOCAL_SIBLING[@]}"; do
-      [ "${#SELECTED_CPUS[@]}" -ge "$target" ] && break
-      SELECTED_CPUS+=("$cpu")
-    done
-  fi
-  if [ "${#SELECTED_CPUS[@]}" -lt "$target" ]; then
-    for cpu in "${REMOTE_PRIMARY[@]}"; do
-      [ "${#SELECTED_CPUS[@]}" -ge "$target" ] && break
-      SELECTED_CPUS+=("$cpu")
-    done
-  fi
-  if [ "${#SELECTED_CPUS[@]}" -lt "$target" ]; then
-    for cpu in "${REMOTE_SIBLING[@]}"; do
-      [ "${#SELECTED_CPUS[@]}" -ge "$target" ] && break
-      SELECTED_CPUS+=("$cpu")
-    done
+  if [ "${#IRQ_CPUS[@]}" -eq 0 ]; then
+    IRQ_CPUS=("${WORKER_CPUS[@]}")
   fi
 }
 
@@ -532,109 +619,238 @@ _apply_queue_count() {
 }
 
 _apply_max_rings() {
-  local rxmax txmax
+  local rxmax txmax cur
+  [ "${MAX_RINGS:-1}" = "1" ] || return 0
   ethtool -g "$DEV" >/dev/null 2>&1 || return 0
   rxmax=$(ethtool -g "$DEV" 2>/dev/null | awk '/Pre-set maximums:/ {sec=1; next} /Current hardware settings:/ {sec=0} sec && $1 == "RX:" {print $2; exit}')
   txmax=$(ethtool -g "$DEV" 2>/dev/null | awk '/Pre-set maximums:/ {sec=1; next} /Current hardware settings:/ {sec=0} sec && $1 == "TX:" {print $2; exit}')
   if [ -n "$rxmax" ] && [ -n "$txmax" ] && [ "$rxmax" != "n/a" ] && [ "$txmax" != "n/a" ]; then
     ethtool -G "$DEV" rx "$rxmax" tx "$txmax" >/dev/null 2>&1 || true
   fi
+  cur=$(_get_current_rings || true)
+  echo "${cur:-unknown}"
+}
+
+_apply_flow_control() {
+  local mode rx tx
+  mode="${FLOW_CONTROL_MODE:-keep}"
+  ethtool -a "$DEV" >/dev/null 2>&1 || return 0
+  case "$mode" in
+    on) ethtool -A "$DEV" rx on tx on >/dev/null 2>&1 || true ;;
+    off) ethtool -A "$DEV" rx off tx off >/dev/null 2>&1 || true ;;
+  esac
+  rx=$(ethtool -a "$DEV" 2>/dev/null | awk -F': ' '/RX:/ {print $2; exit}')
+  tx=$(ethtool -a "$DEV" 2>/dev/null | awk -F': ' '/TX:/ {print $2; exit}')
+  printf 'rx=%s tx=%s' "${rx:-unknown}" "${tx:-unknown}"
 }
 
 _apply_coalesce() {
-  local speed rx tx driver cur_rx cur_tx
+  local speed rx tx driver actual_rx actual_tx
   speed=$(_get_link_speed)
   driver=$(_get_driver)
   ethtool -c "$DEV" >/dev/null 2>&1 || return 0
 
+  # 拦截中断风暴：强制绝对确定性的阈值
   ethtool -C "$DEV" adaptive-rx off adaptive-tx off >/dev/null 2>&1 || true
 
   case "$speed" in
-    ''|*[!0-9]*) rx=15; tx=15 ;;
+    ''|*[!0-9]*) rx=6; tx=6 ;;
     *)
-      if [ "$speed" -ge 100000 ]; then rx=35; tx=35
-      elif [ "$speed" -ge 25000 ]; then rx=30; tx=30
-      elif [ "$speed" -ge 10000 ]; then rx=25; tx=25
-      else rx=15; tx=15
+      if [ "$speed" -ge 100000 ]; then rx=4; tx=4
+      elif [ "$speed" -ge 40000 ]; then rx=5; tx=5
+      elif [ "$speed" -ge 25000 ]; then rx=5; tx=5
+      elif [ "$speed" -ge 10000 ]; then rx=4; tx=4
+      elif [ "$speed" -ge 1000 ]; then rx=8; tx=8
+      else rx=10; tx=10
       fi
       ;;
   esac
 
-  # 分步应用以兼容 ixgbe 硬件锁
-  ethtool -C "$DEV" rx-usecs "$rx" >/dev/null 2>&1 || true
-  ethtool -C "$DEV" tx-usecs "$tx" >/dev/null 2>&1 || true
-  
-  cur_rx=$(ethtool -c "$DEV" 2>/dev/null | awk -F': ' '/rx-usecs:/ {print $2; exit}')
-  cur_tx=$(ethtool -c "$DEV" 2>/dev/null | awk -F': ' '/tx-usecs:/ {print $2; exit}')
-  echo "actual:${cur_rx:-unknown}/${cur_tx:-unknown}"
+  ethtool -C "$DEV" rx-usecs "$rx" tx-usecs "$tx" >/dev/null 2>&1 || true
+  actual_rx=$(ethtool -c "$DEV" 2>/dev/null | awk -F': ' '/rx-usecs:/ {print $2; exit}')
+  actual_tx=$(ethtool -c "$DEV" 2>/dev/null | awk -F': ' '/tx-usecs:/ {print $2; exit}')
+  echo "actual:${actual_rx:-unknown}/${actual_tx:-unknown}"
 }
 
-if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet irqbalance 2>/dev/null; then
-  systemctl stop irqbalance >/dev/null 2>&1 || true
-  systemctl disable irqbalance >/dev/null 2>&1 || true
+_force_fq_qdisc() {
+  [ "${FORCE_FQ:-1}" = "1" ] || return 0
+  modprobe sch_fq >/dev/null 2>&1 || true
+  # 致命修复：针对多队列网卡，必须指定 mq 为根排队规则，防止 TX 拥塞单通道
+  tc qdisc replace dev "$DEV" root mq >/dev/null 2>&1 || true
+}
+
+_calc_rfs_total_flows() {
+  local rxqs workers mem_gb total cap
+  rxqs="$1"; workers="$2"
+  mem_gb=$(awk '/MemTotal:/ {printf "%d\n", int(($2 + 1048575) / 1048576)}' /proc/meminfo)
+  case "$workers" in ''|*[!0-9]*) workers=1 ;; esac
+  total=$(( workers * 4096 ))
+  [ "$total" -lt 32768 ] && total=32768
+  if [ "$rxqs" -ge 16 ] && [ "$total" -lt 131072 ]; then total=131072; fi
+  if [ "$mem_gb" -lt 16 ]; then cap=65536
+  elif [ "$mem_gb" -lt 64 ]; then cap=262144
+  else cap=524288
+  fi
+  [ "$total" -gt "$cap" ] && total="$cap"
+  echo "$total"
+}
+
+_build_group_for_queue() {
+  local idx="$1" total="$2" out=() i
+  for ((i = 0; i < ${#WORKER_CPUS[@]}; i++)); do
+    if [ $(( i % total )) -eq "$idx" ]; then out+=("${WORKER_CPUS[$i]}"); fi
+  done
+  if [ "${#out[@]}" -eq 0 ] && [ "${#WORKER_CPUS[@]}" -gt 0 ]; then
+    out+=("${WORKER_CPUS[$(( idx % ${#WORKER_CPUS[@]} ))]}")
+  fi
+  printf '%s\n' "${out[@]}"
+}
+
+_bitmap_for_all_workers() {
+  local csv=$(IFS=,; echo "${WORKER_CPUS[*]}")
+  _cpulist_to_mask "$csv"
+}
+
+_apply_irq_affinity() {
+  local i irq cpu
+  if [ "${#IRQS[@]}" -gt 0 ]; then
+    for ((i = 0; i < ${#IRQS[@]}; i++)); do
+      irq="${IRQS[$i]}"
+      cpu="${IRQ_CPUS[$(( i % ${#IRQ_CPUS[@]} ))]}"
+      if [ -w "/proc/irq/$irq/smp_affinity_list" ]; then
+        echo "$cpu" > "/proc/irq/$irq/smp_affinity_list" || true
+      fi
+    done
+  fi
+}
+
+_apply_xps() {
+  local i cpu_list csv mask
+  if [ "${#TXQS[@]}" -gt 0 ]; then
+    for ((i = 0; i < ${#TXQS[@]}; i++)); do
+      mapfile -t cpu_list < <(_build_group_for_queue "$i" "${#TXQS[@]}")
+      [ "${#cpu_list[@]}" -gt 0 ] || continue
+      csv=$(IFS=,; echo "${cpu_list[*]}")
+      mask=$(_cpulist_to_mask "$csv")
+      [ -w "${TXQS[$i]}/xps_cpus" ] && echo "$mask" > "${TXQS[$i]}/xps_cpus" || true
+    done
+  fi
+}
+
+_apply_rps_rfs() {
+  local enable total_flows perq i irqcpu csv mask worker_cnt
+  worker_cnt="${#WORKER_CPUS[@]}"
+  enable="${ENABLE_RPS:-auto}"
+  if [ "${#RXQS[@]}" -eq 0 ]; then return 0; fi
+
+  if [ "$enable" = "0" ] || [ "$enable" = "off" ]; then enable="no"
+  elif [ "$enable" = "1" ] || [ "$enable" = "on" ]; then enable="yes"
+  else
+    if [ "${#RXQS[@]}" -lt "$worker_cnt" ]; then enable="yes"; else enable="no"; fi
+  fi
+
+  if [ "$enable" = "yes" ]; then
+    total_flows="${RFS_FLOW_ENTRIES:-auto}"
+    case "$total_flows" in
+      auto|''|*[!0-9]*) total_flows=$(_calc_rfs_total_flows "${#RXQS[@]}" "$worker_cnt") ;;
+    esac
+    echo "$total_flows" > /proc/sys/net/core/rps_sock_flow_entries || true
+    perq=$(( total_flows / ${#RXQS[@]} ))
+    [ "$perq" -lt 1024 ] && perq=1024
+
+    for ((i = 0; i < ${#RXQS[@]}; i++)); do
+      irqcpu="${IRQ_CPUS[$(( i % ${#IRQ_CPUS[@]} ))]}"
+      cpu_list=()
+      local cpu
+      for cpu in "${WORKER_CPUS[@]}"; do
+        [ "$cpu" -ne "$irqcpu" ] && cpu_list+=("$cpu")
+      done
+      [ "${#cpu_list[@]}" -eq 0 ] && cpu_list=("$irqcpu")
+      csv=$(IFS=,; echo "${cpu_list[*]}")
+      mask=$(_cpulist_to_mask "$csv")
+      [ -w "${RXQS[$i]}/rps_cpus" ] && echo "$mask" > "${RXQS[$i]}/rps_cpus" || true
+      [ -w "${RXQS[$i]}/rps_flow_cnt" ] && echo "$perq" > "${RXQS[$i]}/rps_flow_cnt" || true
+    done
+
+    if [ -e /proc/sys/net/core/flow_limit_cpu_bitmap ] && [ "${ENABLE_FLOW_LIMIT:-auto}" != "0" ]; then
+      echo "$(_bitmap_for_all_workers)" > /proc/sys/net/core/flow_limit_cpu_bitmap || true
+    fi
+  else
+    for Q in "${RXQS[@]}"; do
+      [ -w "$Q/rps_cpus" ] && echo 0 > "$Q/rps_cpus" || true
+      [ -w "$Q/rps_flow_cnt" ] && echo 0 > "$Q/rps_flow_cnt" || true
+    done
+    echo 0 > /proc/sys/net/core/rps_sock_flow_entries || true
+    [ -e /proc/sys/net/core/flow_limit_cpu_bitmap ] && echo 0 > /proc/sys/net/core/flow_limit_cpu_bitmap || true
+  fi
+}
+
+_maybe_disable_irqbalance() {
+  local policy="${IRQBALANCE_POLICY:-auto}"
+  if ! command -v systemctl >/dev/null 2>&1; then return 0; fi
+  if ! systemctl is-active --quiet irqbalance 2>/dev/null; then return 0; fi
+  case "$policy" in
+    keep) return 0 ;;
+    disable)
+      if [ "${DISABLE_IRQBALANCE:-1}" = "1" ]; then
+        systemctl stop irqbalance >/dev/null 2>&1 || true
+        systemctl disable irqbalance >/dev/null 2>&1 || true
+      fi
+      ;;
+    auto|'')
+      systemctl stop irqbalance >/dev/null 2>&1 || true
+      systemctl disable irqbalance >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
+if ! ip link show "$DEV" >/dev/null 2>&1; then
+  echo "网卡接口 $DEV 不存在"
+  exit 1
 fi
 
+_build_worker_cpu_list
 TARGET_QUEUES=$(_pick_target_queues)
+[ "$TARGET_QUEUES" -le 0 ] && TARGET_QUEUES=1
+
 TARGET_QUEUES=$(_apply_queue_count "$TARGET_QUEUES")
+[ "$TARGET_QUEUES" -le 0 ] && TARGET_QUEUES=1
 
-_build_cpu_list "$TARGET_QUEUES"
-CPUS=("${SELECTED_CPUS[@]}")
-CPU_CSV=$(IFS=,; echo "${CPUS[*]}")
+_build_irq_cpu_list "$TARGET_QUEUES"
+[ "${#WORKER_CPUS[@]}" -gt 0 ] || { echo "未选出工作 CPU"; exit 1; }
+[ "${#IRQ_CPUS[@]}" -gt 0 ] || { echo "未选出 IRQ CPU"; exit 1; }
 
-_apply_max_rings
+_maybe_disable_irqbalance
+
+RING_RESULT=$(_apply_max_rings)
+FLOW_RESULT=$(_apply_flow_control)
 COALESCE_RESULT=$(_apply_coalesce)
 
 mapfile -t RXQS < <(find "/sys/class/net/$DEV/queues" -maxdepth 1 -type d -name 'rx-*' | sort -V)
 mapfile -t TXQS < <(find "/sys/class/net/$DEV/queues" -maxdepth 1 -type d -name 'tx-*' | sort -V)
 mapfile -t IRQS < <(awk -v dev="$DEV" '$0 ~ dev {gsub(":", "", $1); print $1}' /proc/interrupts)
 
-if [ "${#IRQS[@]}" -gt 0 ]; then
-  for ((i = 0; i < ${#IRQS[@]}; i++)); do
-    IRQ="${IRQS[$i]}"
-    CPU="${CPUS[$(( i % ${#CPUS[@]} ))]}"
-    if [ -w "/proc/irq/$IRQ/smp_affinity_list" ]; then
-      echo "$CPU" > "/proc/irq/$IRQ/smp_affinity_list" || true
-    fi
-  done
+_apply_irq_affinity
+_apply_xps
+_apply_rps_rfs
+_force_fq_qdisc
+
+WORKER_CSV=$(IFS=,; echo "${WORKER_CPUS[*]}")
+IRQ_CSV=$(IFS=,; echo "${IRQ_CPUS[*]}")
+
+printf '网卡: %s\n' "$DEV"
+printf '驱动: %s\n' "$(_get_driver || echo unknown)"
+printf '链路速率: %s Mb/s\n' "$(_get_link_speed || echo unknown)"
+printf 'NUMA 节点: %s\n' "$(_get_nic_numa_node || echo -1)"
+printf '工作 CPU 数: %s\n' "${#WORKER_CPUS[@]}"
+printf '目标队列(锁定物理核): %s\n' "$TARGET_QUEUES"
+printf 'ring: %s\n' "$RING_RESULT"
+printf 'flow control: %s\n' "$FLOW_RESULT"
+printf 'coalesce: %s\n' "$COALESCE_RESULT"
+printf 'rps_sock_flow_entries: %s\n' "$(cat /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || echo 0)"
+if [ -e /proc/sys/net/core/flow_limit_cpu_bitmap ]; then
+  printf 'flow_limit_cpu_bitmap: %s\n' "$(cat /proc/sys/net/core/flow_limit_cpu_bitmap 2>/dev/null || echo 0)"
 fi
-
-if [ "${#TXQS[@]}" -gt 0 ]; then
-  for ((i = 0; i < ${#TXQS[@]}; i++)); do
-    CPU="${CPUS[$(( i % ${#CPUS[@]} ))]}"
-    MASK=$(_cpulist_to_mask "$CPU")
-    [ -w "${TXQS[$i]}/xps_cpus" ] && echo "$MASK" > "${TXQS[$i]}/xps_cpus" || true
-  done
-fi
-
-ALL_CPUS=()
-for cpu in "${LOCAL_PRIMARY[@]}" "${LOCAL_SIBLING[@]}" "${REMOTE_PRIMARY[@]}" "${REMOTE_SIBLING[@]}"; do
-  ALL_CPUS+=("$cpu")
-done
-
-if [ "${#RXQS[@]}" -gt 0 ]; then
-  TOTAL_FLOWS=262144
-  echo "$TOTAL_FLOWS" > /proc/sys/net/core/rps_sock_flow_entries || true
-  PERQ=$(( TOTAL_FLOWS / ${#RXQS[@]} ))
-  [ "$PERQ" -lt 1024 ] && PERQ=1024
-
-  for ((i = 0; i < ${#RXQS[@]}; i++)); do
-    IRQCPU="${CPUS[$(( i % ${#CPUS[@]} ))]}"
-    RPS_CPUS=()
-    for cpu in "${ALL_CPUS[@]}"; do
-      [ "$cpu" -ne "$IRQCPU" ] && RPS_CPUS+=("$cpu")
-    done
-    [ "${#RPS_CPUS[@]}" -eq 0 ] && RPS_CPUS=("$IRQCPU")
-    
-    LIST=$(IFS=,; echo "${RPS_CPUS[*]}")
-    MASK=$(_cpulist_to_mask "$LIST")
-    [ -w "${RXQS[$i]}/rps_cpus" ] && echo "$MASK" > "${RXQS[$i]}/rps_cpus" || true
-    [ -w "${RXQS[$i]}/rps_flow_cnt" ] && echo "$PERQ" > "${RXQS[$i]}/rps_flow_cnt" || true
-  done
-fi
-
-# 修正：恢复 mq 多队列为 root 规则，内层依靠内核 default_qdisc=fq 自动挂载子叶子
-tc qdisc replace dev "$DEV" root mq >/dev/null 2>&1 || true
-
 printf '网卡调优已应用到 %s\n' "$DEV"
 EOF_HELPER
 
@@ -646,6 +862,7 @@ build_nic_service() {
 [Unit]
 Description=Live Relay Smart Auto NIC Tuning
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
@@ -672,18 +889,28 @@ select_nic_noninteractive() {
 
 setup_persistence() {
   local nic="$1"
-  ensure_cmd ethtool && ensure_cmd python3 && ensure_cmd ip && ensure_cmd tc && ensure_cmd lscpu
+  ensure_cmd ethtool && ensure_cmd python3 && ensure_cmd ip && ensure_cmd tc && ensure_cmd lscpu || true
   build_nic_helper
   build_nic_service
   cat > "$NIC_ENV_FILE" <<EOF_NICENV
 DEV=$nic
 USE_HT=${USE_HT:-auto}
+WORKER_CPUS_TARGET=${WORKER_CPUS_TARGET:-auto}
+TARGET_QUEUES=${TARGET_QUEUES:-auto}
+MAX_RINGS=${MAX_RINGS:-1}
+RFS_FLOW_ENTRIES=${RFS_FLOW_ENTRIES:-auto}
+ENABLE_RPS=${ENABLE_RPS:-auto}
+ENABLE_FLOW_LIMIT=${ENABLE_FLOW_LIMIT:-auto}
+DISABLE_IRQBALANCE=${DISABLE_IRQBALANCE:-1}
+IRQBALANCE_POLICY=${IRQBALANCE_POLICY:-auto}
+FLOW_CONTROL_MODE=${FLOW_CONTROL_MODE:-keep}
+FORCE_FQ=${FORCE_FQ:-1}
 EOF_NICENV
   "$NIC_HELPER"
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload
     systemctl enable --now live-relay-smart-auto.service >/dev/null 2>&1 || true
-    log "自适应网卡调优已激活。"
+    log "智能硬件自适应网卡调优服务已安装并启用。"
   fi
 }
 
@@ -699,15 +926,20 @@ apply_smart() {
 
 show_status() {
   local nic cc qdisc avail saved_nic profile
-  local driver speed numa
+  local driver speed numa worker_target target_queues use_ht irq_policy
 
   saved_nic=""
   profile="unknown"
+  if [ -f "$STATE_FILE" ]; then source "$STATE_FILE" || true; profile="${PROFILE:-unknown}"; saved_nic="${NIC:-}"; fi
 
-  if [ -f "$STATE_FILE" ]; then
-    source "$STATE_FILE" || true
-    profile="${PROFILE:-unknown}"
-    saved_nic="${NIC:-}"
+  if [ -f "$NIC_ENV_FILE" ]; then
+    source "$NIC_ENV_FILE" || true
+    worker_target="${WORKER_CPUS_TARGET:-auto}"
+    target_queues="${TARGET_QUEUES:-auto}"
+    use_ht="${USE_HT:-auto}"
+    irq_policy="${IRQBALANCE_POLICY:-auto}"
+  else
+    worker_target="auto"; target_queues="auto"; use_ht="auto"; irq_policy="auto"
   fi
 
   cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
@@ -724,15 +956,9 @@ show_status() {
   printf '%-22s %s\n' "somaxconn:" "$(sysctl -n net.core.somaxconn 2>/dev/null || true)"
   printf '%-22s %s\n' "tcp_max_syn_backlog:" "$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || true)"
   printf '%-22s %s\n' "netdev_max_backlog:" "$(sysctl -n net.core.netdev_max_backlog 2>/dev/null || true)"
-  printf '%-22s %s\n' "netdev_budget:" "$(sysctl -n net.core.netdev_budget 2>/dev/null || true)"
-  printf '%-22s %s\n' "budget_usecs:" "$(sysctl -n net.core.netdev_budget_usecs 2>/dev/null || true)"
   printf '%-22s %s\n' "fs.file-max:" "$(sysctl -n fs.file-max 2>/dev/null || true)"
   printf '%-22s %s\n' "tcp_rmem:" "$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || true)"
   printf '%-22s %s\n' "tcp_wmem:" "$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || true)"
-  printf '%-22s %s\n' "udp_rmem_min:" "$(sysctl -n net.ipv4.udp_rmem_min 2>/dev/null || true)"
-  printf '%-22s %s\n' "udp_wmem_min:" "$(sysctl -n net.ipv4.udp_wmem_min 2>/dev/null || true)"
-  printf '%-22s %s\n' "tcp_limit_output:" "$(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null || true)"
-  printf '%-22s %s\n' "tcp_notsent_lowat:" "$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || true)"
   printf '%-22s %s\n' "conntrack_count:" "$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo n/a)"
   printf '%-22s %s\n' "conntrack_max:" "$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo n/a)"
   printf '%-22s %s\n' "检测到的网卡:" "${nic:-none}"
@@ -740,11 +966,7 @@ show_status() {
   if [ -n "$nic" ] && command -v ethtool >/dev/null 2>&1 && ip link show "$nic" >/dev/null 2>&1; then
     driver="$(ethtool -i "$nic" 2>/dev/null | awk -F': ' '/driver:/ {print $2; exit}')"
     speed="$(ethtool "$nic" 2>/dev/null | awk -F': ' '/Speed:/ {print $2; exit}')"
-    if [ -r "/sys/class/net/$nic/device/numa_node" ]; then
-      numa="$(cat "/sys/class/net/$nic/device/numa_node" 2>/dev/null || echo -1)"
-    else
-      numa="-1"
-    fi
+    if [ -r "/sys/class/net/$nic/device/numa_node" ]; then numa="$(cat "/sys/class/net/$nic/device/numa_node" 2>/dev/null || echo -1)"; else numa="-1"; fi
 
     printf '%-22s %s\n' "驱动:" "${driver:-unknown}"
     printf '%-22s %s\n' "链路速率:" "${speed:-unknown}"
@@ -757,63 +979,17 @@ show_status() {
       printf '%-22s %s\n' "网卡通道信息:" "combined ${cur_combined:-unknown}/${max_combined:-unknown}"
     fi
 
-    if ethtool -g "$nic" >/dev/null 2>&1; then
-      local cur_rx cur_tx max_rx max_tx
-      max_rx="$(ethtool -g "$nic" 2>/dev/null | awk '/Pre-set maximums:/ {sec=1; next} /Current hardware settings:/ {sec=0} sec && $1 == "RX:" {print $2; exit}')"
-      max_tx="$(ethtool -g "$nic" 2>/dev/null | awk '/Pre-set maximums:/ {sec=1; next} /Current hardware settings:/ {sec=0} sec && $1 == "TX:" {print $2; exit}')"
-      cur_rx="$(ethtool -g "$nic" 2>/dev/null | awk '/Current hardware settings:/ {sec=1; next} sec && $1 == "RX:" {print $2; exit}')"
-      cur_tx="$(ethtool -g "$nic" 2>/dev/null | awk '/Current hardware settings:/ {sec=1; next} sec && $1 == "TX:" {print $2; exit}')"
-      printf '%-22s %s\n' "ring 信息:" "rx ${cur_rx:-unknown}/${max_rx:-unknown}, tx ${cur_tx:-unknown}/${max_tx:-unknown}"
-    fi
-
     if ethtool -c "$nic" >/dev/null 2>&1; then
       echo "coalesce:"
-      ethtool -c "$nic" 2>/dev/null | awk -F': ' '
-        /Adaptive RX:/ || /Adaptive TX:/ || /rx-usecs:/ || /tx-usecs:/ {
-          gsub(/^[ \t]+/, "", $1); printf "  %-18s %s\n", $1 ":", $2
-        }' || true
+      ethtool -c "$nic" 2>/dev/null | awk -F': ' '/Adaptive RX:/ || /Adaptive TX:/ || /rx-usecs:/ || /tx-usecs:/ { gsub(/^[ \t]+/, "", $1); printf "  %-18s %s\n", $1 ":", $2 }' || true
     fi
 
-    echo "网卡错误信息:"
-    ethtool -S "$nic" 2>/dev/null | awk -F': ' '
-  NF >= 2 {
-    key=$1; val=$2
-    gsub(/^[ \t]+/, "", key); gsub(/^[ \t]+/, "", val)
-    if (key ~ /rx_dropped$/ || key ~ /rx_missed_errors$/ || key ~ /rx_over_errors$/ || key ~ /rx_no_buffer_count$/ || key ~ /tx_errors$/) {
-      printf "  %-26s %s\n", key ":", val; found=1
-    }
-  }
-  END { if (!found) print "  无明显错误计数" }
-    ' || true
-
-    echo "IRQ 分布:"
-    awk -v dev="$nic" '
-      $0 ~ dev {
-        irq=$1; sub(":", "", irq); sum=0
-        for (i=2; i<=NF; i++) { if ($i ~ /^[0-9]+$/) sum += $i; else break }
-        name=$NF; printf "  IRQ %-4s 总中断=%-12s 设备=%s\n", irq, sum, name; found=1
-      }
-      END { if (!found) print "  未找到相关 IRQ" }
-    ' /proc/interrupts || true
-
-    echo "IRQ 亲和性:"
-    {
-      found_irq=0
-      while read -r irq; do
-        [ -n "$irq" ] || continue
-        found_irq=1
-        if [ -r "/proc/irq/$irq/smp_affinity_list" ]; then
-          printf '  IRQ %-4s CPU=%s\n' "$irq" "$(cat "/proc/irq/$irq/smp_affinity_list" 2>/dev/null)"
-        else
-          printf '  IRQ %-4s CPU=%s\n' "$irq" "unknown"
-        fi
-      done < <(awk -v dev="$nic" '$0 ~ dev {gsub(":", "", $1); print $1}' /proc/interrupts)
-      [ "$found_irq" -eq 1 ] || echo "  未找到相关 IRQ"
-    } || true
+    echo "IRQ 分布 (示例前几项):"
+    awk -v dev="$nic" '$0 ~ dev { irq=$1; sub(":", "", irq); sum=0; for(i=2;i<=NF;i++){ if($i~/^[0-9]+$/) sum+=$i; else break } printf "  IRQ %-4s 总中断=%-12s 设备=%s\n", irq, sum, $NF; found++; if(found>=5) exit }' /proc/interrupts || true
 
     if command -v tc >/dev/null 2>&1; then
       echo "qdisc:"
-      tc qdisc show dev "$nic" 2>/dev/null | sed 's/^/  /' || true
+      tc qdisc show dev "$nic" 2>/dev/null | head -n 5 | sed 's/^/  /' || true
       printf '%-22s %s\n' "leaf fq 统计:" "$(tc qdisc show dev "$nic" 2>/dev/null | awk '/ parent / {total++} / parent / && / fq / {fq++} END {printf "%d/%d", fq+0, total+0}')"
     fi
   fi
@@ -825,9 +1001,6 @@ show_status() {
       printf '%-22s %s\n' "网卡调优服务:" "disabled"
     fi
   fi
-
-  printf '%-22s %s\n' "sysctl 文件:" "$SYSCTL_FILE"
-  printf '%-22s %s\n' "网卡环境文件:" "$NIC_ENV_FILE"
   echo "========================================="
   echo
 }
@@ -836,24 +1009,11 @@ cleanup_smart() {
   info "正在清理 smart-auto 配置..."
   remove_service
   rm -f "$LIMITS_FILE" "$SYSTEMD_LIMIT_FILE" "$SYSCTL_FILE" "$STATE_FILE"
-
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload >/dev/null 2>&1 || true
-  fi
-
-  if is_container; then
-    warn "检测到容器环境，已完成基础清理。"
-    return 0
-  fi
-
-  if grep -qaE 'lxc|container' /proc/1/environ 2>/dev/null || grep -qaE 'lxc|container' /proc/1/cgroup 2>/dev/null; then
-    echo -e "${YELLOW}⚠️ 检测到当前环境为 LXC 容器，已完成基础清理，但跳过 HIA BBR 优化。${RESET}"
-    return 0
-  fi
+  if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload >/dev/null 2>&1 || true; fi
+  if is_container; then warn "检测到容器环境，已完成基础清理。"; return 0; fi
+  if grep -qaE 'lxc|container' /proc/1/environ 2>/dev/null || grep -qaE 'lxc|container' /proc/1/cgroup 2>/dev/null; then echo -e "${YELLOW}⚠️ 检测到容器，跳过 HIA BBR 优化。${RESET}"; return 0; fi
 
   echo -e "${GREEN}[信息] 正在注入 HIA 极限基线参数...${RESET}"
-  cp -n /etc/sysctl.conf /etc/sysctl.conf.bak || true
-
   cat > /etc/sysctl.conf <<EOF
 # ===== HIA BBR + TCP 优化参数 =====
 net.core.default_qdisc = fq
@@ -902,20 +1062,19 @@ vm.dirty_ratio = 10
 vm.dirty_background_ratio = 5
 # ===== End HIA =====
 EOF
-
   sysctl --system >/dev/null 2>&1 || true
-  log "清理完成，已回退HIA极限高并发。"
+  log "清理完成，已回退 HIA 极限高并发。"
 }
 
 show_menu() {
   clear || true
   cat <<'EOF_MENU'
 =====================================================
- Live Relay 智能自适调优工具
+ Live Relay 智能自适调优工具（硬件感知版）
 =====================================================
  1) 智能极限低延迟模式
  2) 查看当前状态
- 3) 清理配置回退HIA
+ 3) 清理配置回退 HIA
  0) 退出
 =====================================================
 EOF_MENU
