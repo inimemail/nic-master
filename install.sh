@@ -717,6 +717,7 @@ show_status() {
 }
 
 cleanup_live_relay() {
+  echo -e "${BLUE}[处理中] 正在清理历史调优配置文件...${RESET}"
   remove_mode2_service
   rm -f "$LIMITS_FILE" "$SYSTEMD_LIMIT_FILE" "$SYSCTL_FILE" "$STATE_FILE"
   if command -v systemctl >/dev/null 2>&1; then
