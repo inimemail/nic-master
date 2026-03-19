@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="5.1.1-smart-auto"
+VERSION="5.1.2-smart-auto"
 WORKDIR="/opt/live-relay-smart-auto"
 NIC_ENV_FILE="/etc/live-relay-smart-auto.env"
 NIC_HELPER="/usr/local/sbin/live-relay-smart-auto-apply.sh"
@@ -119,7 +119,6 @@ pick_cc_algo() {
   available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
   if echo " $available " | grep -q ' bbr '; then echo bbr; return 0; fi
 
-  warn "当前内核不支持 BBR，回退到当前拥塞控制算法：$current"
   echo "$current"
 }
 
@@ -204,25 +203,26 @@ calc_somaxconn() {
 write_limits() {
   mkdir -p "$(dirname "$LIMITS_FILE")" "$SYSTEMD_LIMIT_DIR"
 
+  # 修正：将 ulimit 限制回落到 Linux 默认的内核 fs.nr_open 极限内 (1048576)
   cat > "$LIMITS_FILE" <<'EOF_LIMITS'
-* soft nofile 2097152
-* hard nofile 2097152
+* soft nofile 1048576
+* hard nofile 1048576
 * soft nproc  1048576
 * hard nproc  1048576
-root soft nofile 2097152
-root hard nofile 2097152
+root soft nofile 1048576
+root hard nofile 1048576
 root soft nproc  1048576
 root hard nproc  1048576
 EOF_LIMITS
 
   cat > "$SYSTEMD_LIMIT_FILE" <<'EOF_SYSTEMD'
 [Manager]
-DefaultLimitNOFILE=2097152
+DefaultLimitNOFILE=1048576
 DefaultLimitNPROC=1048576
 DefaultTasksMax=infinity
 EOF_SYSTEMD
 
-  ulimit -SHn 2097152 || true
+  ulimit -SHn 1048576 || true
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reexec >/dev/null 2>&1 || systemctl daemon-reload >/dev/null 2>&1 || true
   fi
@@ -261,6 +261,7 @@ write_smart_profile() {
 # =====================================================
 EOF_HEADER
 
+  # 内核默认启用 fq，配合网卡的 mq 会自动生成 mq + 多叶子 fq
   append_if_supported net.core.default_qdisc fq
   append_if_supported net.ipv4.tcp_congestion_control "$cc"
 
@@ -473,10 +474,8 @@ _calc_auto_queue_base() {
   max_combined=$(_get_max_combined)
   cpu_count=$(nproc 2>/dev/null || echo 8)
 
-  # 极度激进：默认尝试将硬件队列直接拉满到总核心数
   target_q=$cpu_count
 
-  # 硬件约束：绝不能超过网卡芯片的最大物理通道（例如 ixgbe 的 63，bnxt_en 的 74）
   if [ -n "$max_combined" ] && [ "$max_combined" != "n/a" ] && [ "$max_combined" -gt 0 ]; then
     [ "$target_q" -gt "$max_combined" ] && target_q="$max_combined"
   fi
@@ -548,7 +547,6 @@ _apply_coalesce() {
   driver=$(_get_driver)
   ethtool -c "$DEV" >/dev/null 2>&1 || return 0
 
-  # 拦截中断风暴：关闭 auto，固定合理的中断聚合延迟以消除 rx_missed_errors
   ethtool -C "$DEV" adaptive-rx off adaptive-tx off >/dev/null 2>&1 || true
 
   case "$speed" in
@@ -562,7 +560,10 @@ _apply_coalesce() {
       ;;
   esac
 
-  ethtool -C "$DEV" rx-usecs "$rx" tx-usecs "$tx" >/dev/null 2>&1 || true
+  # 分步应用以兼容 ixgbe 硬件锁
+  ethtool -C "$DEV" rx-usecs "$rx" >/dev/null 2>&1 || true
+  ethtool -C "$DEV" tx-usecs "$tx" >/dev/null 2>&1 || true
+  
   cur_rx=$(ethtool -c "$DEV" 2>/dev/null | awk -F': ' '/rx-usecs:/ {print $2; exit}')
   cur_tx=$(ethtool -c "$DEV" 2>/dev/null | awk -F': ' '/tx-usecs:/ {print $2; exit}')
   echo "actual:${cur_rx:-unknown}/${cur_tx:-unknown}"
@@ -605,7 +606,6 @@ if [ "${#TXQS[@]}" -gt 0 ]; then
   done
 fi
 
-# 收集所有的核心，用于软中断 RPS 负载均衡，确保 40核/80核 无一闲置
 ALL_CPUS=()
 for cpu in "${LOCAL_PRIMARY[@]}" "${LOCAL_SIBLING[@]}" "${REMOTE_PRIMARY[@]}" "${REMOTE_SIBLING[@]}"; do
   ALL_CPUS+=("$cpu")
@@ -632,7 +632,8 @@ if [ "${#RXQS[@]}" -gt 0 ]; then
   done
 fi
 
-tc qdisc replace dev "$DEV" root fq >/dev/null 2>&1 || true
+# 修正：恢复 mq 多队列为 root 规则，内层依靠内核 default_qdisc=fq 自动挂载子叶子
+tc qdisc replace dev "$DEV" root mq >/dev/null 2>&1 || true
 
 printf '网卡调优已应用到 %s\n' "$DEV"
 EOF_HELPER
