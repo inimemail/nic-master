@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="5.2.1-smart-hw-deterministic"
+VERSION="5.2.2-smart-hw-deterministic"
 WORKDIR="/opt/live-relay-smart-auto"
 NIC_ENV_FILE="/etc/live-relay-smart-auto.env"
 NIC_HELPER="/usr/local/sbin/live-relay-smart-auto-apply.sh"
@@ -672,7 +672,10 @@ _apply_coalesce() {
 _force_fq_qdisc() {
   [ "${FORCE_FQ:-1}" = "1" ] || return 0
   modprobe sch_fq >/dev/null 2>&1 || true
-  tc qdisc replace dev "$DEV" root mq >/dev/null 2>&1 || true
+  
+  # 【致命修复】针对 bnxt_en 和内核惰性：彻底物理拔除旧规则树，强制依据新 default_qdisc 重生 
+  tc qdisc del dev "$DEV" root >/dev/null 2>&1 || true
+  tc qdisc add dev "$DEV" root mq >/dev/null 2>&1 || true
 }
 
 _calc_rfs_total_flows() {
@@ -903,7 +906,7 @@ FLOW_CONTROL_MODE=${FLOW_CONTROL_MODE:-keep}
 FORCE_FQ=${FORCE_FQ:-1}
 EOF_NICENV
 
-  info "正在智能自适应网卡调优，请稍后..."
+  info "正在编译内核级十六进制位掩码，保证物理核绑定的绝对精度 (预计耗时 1-3 秒，请稍候)..."
   "$NIC_HELPER"
 
   if command -v systemctl >/dev/null 2>&1; then
@@ -983,7 +986,6 @@ show_status() {
       ethtool -c "$nic" 2>/dev/null | awk -F': ' '/Adaptive RX:/ || /Adaptive TX:/ || /rx-usecs:/ || /tx-usecs:/ { gsub(/^[ \t]+/, "", $1); printf "  %-18s %s\n", $1 ":", $2 }' || true
     fi
 
-    # 毫无保留地展示全部 IRQ 中断分布
     echo "IRQ 分布 (全量展示):"
     awk -v dev="$nic" '$0 ~ dev { irq=$1; sub(":", "", irq); sum=0; for(i=2;i<=NF;i++){ if($i~/^[0-9]+$/) sum+=$i; else break } printf "  IRQ %-4s 总中断=%-12s 设备=%s\n", irq, sum, $NF }' /proc/interrupts || true
 
@@ -1070,7 +1072,7 @@ show_menu() {
   clear || true
   cat <<'EOF_MENU'
 =====================================================
- Live Relay 智能自适调优工具
+ Live Relay 智能自适调优工具（硬件感知版）
 =====================================================
  1) 智能极限低延迟模式
  2) 查看当前状态
