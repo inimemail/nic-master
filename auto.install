@@ -1181,14 +1181,24 @@ show_status() {
 
     echo "网卡错误信息:"
     ethtool -S "$nic" 2>/dev/null | awk -F': ' '
-      /rx_(missed|over|dropped)/ || /tx_.*errors/ || /rx_no_buffer_count/ {
-        gsub(/^[ \t]+/, "", $1)
-        printf "  %-26s %s\n", $1 ":", $2
-        found=1
-      }
-      END {
-        if (!found) print "  无明显错误计数"
-      }
+  NF >= 2 {
+    key=$1
+    val=$2
+    gsub(/^[ \t]+/, "", key)
+    gsub(/^[ \t]+/, "", val)
+
+    if (key ~ /rx_dropped$/ ||
+        key ~ /rx_missed_errors$/ ||
+        key ~ /rx_over_errors$/ ||
+        key ~ /rx_no_buffer_count$/ ||
+        key ~ /tx_errors$/) {
+      printf "  %-26s %s\n", key ":", val
+      found=1
+    }
+  }
+  END {
+    if (!found) print "  无明显错误计数"
+  }
     ' || true
 
     echo "IRQ 分布:"
