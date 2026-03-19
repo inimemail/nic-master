@@ -903,7 +903,7 @@ FLOW_CONTROL_MODE=${FLOW_CONTROL_MODE:-keep}
 FORCE_FQ=${FORCE_FQ:-1}
 EOF_NICENV
 
-  info "正在编译内核级十六进制位掩码，保证物理核绑定的绝对精度 (预计耗时 1-3 秒，请稍候)..."
+  info "正在智能自适应网卡调优，请稍后..."
   "$NIC_HELPER"
 
   if command -v systemctl >/dev/null 2>&1; then
