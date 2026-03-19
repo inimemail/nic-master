@@ -722,7 +722,67 @@ cleanup_live_relay() {
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
-  warn "已删除本工具生成的配置文件。已写入内核的运行时参数不会自动恢复，建议重启主机或手动执行 sysctl --system 后按需校正。"
+  if grep -qaE 'lxc|container' /proc/1/environ 2>/dev/null || grep -qaE 'lxc|container' /proc/1/cgroup 2>/dev/null; then
+    echo -e "${YELLOW}⚠️ 检测到当前环境为 LXC 容器，已完成基础清理，但跳过 HIA BBR 优化。${RESET}"
+    return
+  fi
+
+  echo -e "${GREEN}[信息] 正在注入 HIA 极限基线参数...${RESET}"
+  cp -n /etc/sysctl.conf /etc/sysctl.conf.bak || true
+
+  cat > /etc/sysctl.conf <<EOF
+# ===== HIA BBR + TCP 优化参数 =====
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 50331648
+net.core.wmem_max = 50331648
+net.core.rmem_default = 6291456
+net.core.wmem_default = 6291456
+net.ipv4.tcp_rmem = 4096 87380 50331648
+net.ipv4.tcp_wmem = 4096 65536 50331648
+net.ipv4.udp_rmem_min = 131072
+net.ipv4.udp_wmem_min = 131072
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_ecn = 0
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_early_retrans = 3
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_low_latency = 1
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_retries1 = 3
+net.ipv4.tcp_retries2 = 8
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.netdev_max_backlog = 150000
+net.core.netdev_budget = 700
+net.core.netdev_budget_usecs = 1200
+net.core.dev_weight = 768
+net.core.dev_weight_tx_bias = 2
+net.core.optmem_max = 81920
+net.core.busy_poll = 50
+net.core.busy_read = 50
+net.ipv4.ip_local_port_range = 1024 65535
+fs.file-max = 16777216
+vm.swappiness = 10
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 5
+# ===== End HIA =====
+EOF
+
+  sysctl -p >/dev/null 2>&1 || true
+  
+  echo -e "${GREEN}清理完成！系统已强制回退并锁定至 HIA 全局高并发基线。${RESET}"
+  sleep 2
 }
 
 show_menu() {
@@ -734,7 +794,7 @@ show_menu() {
  1) 稳定高容量模式
  2) 极限低延迟模式
  3) 查看当前状态
- 4) 清理生成配置
+ 4) 清理配置回退HIA
  0) 退出
 =====================================================
 EOF_MENU
