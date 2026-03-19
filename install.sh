@@ -656,8 +656,10 @@ apply_profile() {
 
 show_status() {
   local nic cc qdisc avail profile saved_nic
+  local driver speed numa
   profile="unknown"
   saved_nic=""
+
   if [ -f "$STATE_FILE" ]; then
     # shellcheck disable=SC1090
     source "$STATE_FILE" || true
@@ -672,46 +674,134 @@ show_status() {
 
   echo
   echo "================ 状态信息 ================"
-  echo "当前配置:            $profile"
-  echo "拥塞控制算法:        $cc"
-  echo "可用拥塞控制:        $avail"
-  echo "默认 qdisc:          $qdisc"
-  echo "somaxconn:           $(sysctl -n net.core.somaxconn 2>/dev/null || true)"
-  echo "tcp_max_syn_backlog: $(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || true)"
-  echo "netdev_max_backlog:  $(sysctl -n net.core.netdev_max_backlog 2>/dev/null || true)"
-  echo "netdev_budget:       $(sysctl -n net.core.netdev_budget 2>/dev/null || true)"
-  echo "budget_usecs:        $(sysctl -n net.core.netdev_budget_usecs 2>/dev/null || true)"
-  echo "fs.file-max:         $(sysctl -n fs.file-max 2>/dev/null || true)"
-  echo "tcp_rmem:            $(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || true)"
-  echo "tcp_wmem:            $(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || true)"
-  echo "udp_rmem_min:        $(sysctl -n net.ipv4.udp_rmem_min 2>/dev/null || true)"
-  echo "tcp_limit_output:    $(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null || true)"
-  echo "tcp_notsent_lowat:   $(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || true)"
-  echo "conntrack_count:     $(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo n/a)"
-  echo "conntrack_max:       $(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo n/a)"
-  echo "检测到的网卡:        ${nic:-none}"
+  printf '%-22s %s\n' "当前配置:" "$profile"
+  printf '%-22s %s\n' "拥塞控制算法:" "$cc"
+  printf '%-22s %s\n' "可用拥塞控制:" "$avail"
+  printf '%-22s %s\n' "默认 qdisc:" "$qdisc"
+  printf '%-22s %s\n' "somaxconn:" "$(sysctl -n net.core.somaxconn 2>/dev/null || true)"
+  printf '%-22s %s\n' "tcp_max_syn_backlog:" "$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || true)"
+  printf '%-22s %s\n' "netdev_max_backlog:" "$(sysctl -n net.core.netdev_max_backlog 2>/dev/null || true)"
+  printf '%-22s %s\n' "netdev_budget:" "$(sysctl -n net.core.netdev_budget 2>/dev/null || true)"
+  printf '%-22s %s\n' "budget_usecs:" "$(sysctl -n net.core.netdev_budget_usecs 2>/dev/null || true)"
+  printf '%-22s %s\n' "fs.file-max:" "$(sysctl -n fs.file-max 2>/dev/null || true)"
+  printf '%-22s %s\n' "tcp_rmem:" "$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || true)"
+  printf '%-22s %s\n' "tcp_wmem:" "$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || true)"
+  printf '%-22s %s\n' "udp_rmem_min:" "$(sysctl -n net.ipv4.udp_rmem_min 2>/dev/null || true)"
+  printf '%-22s %s\n' "tcp_limit_output:" "$(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null || true)"
+  printf '%-22s %s\n' "tcp_notsent_lowat:" "$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || true)"
+  printf '%-22s %s\n' "conntrack_count:" "$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo n/a)"
+  printf '%-22s %s\n' "conntrack_max:" "$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo n/a)"
+  printf '%-22s %s\n' "检测到的网卡:" "${nic:-none}"
 
   if [ -n "$nic" ] && command -v ethtool >/dev/null 2>&1 && ip link show "$nic" >/dev/null 2>&1; then
-    echo "网卡通道信息:"
-    ethtool -l "$nic" 2>/dev/null | sed 's/^/  /' || true
+    driver="$(ethtool -i "$nic" 2>/dev/null | awk -F': ' '/driver:/ {print $2; exit}')"
+    speed="$(ethtool "$nic" 2>/dev/null | awk -F': ' '/Speed:/ {print $2; exit}')"
+    if [ -r "/sys/class/net/$nic/device/numa_node" ]; then
+      numa="$(cat "/sys/class/net/$nic/device/numa_node" 2>/dev/null || echo -1)"
+    else
+      numa="-1"
+    fi
+
+    printf '%-22s %s\n' "驱动:" "${driver:-unknown}"
+    printf '%-22s %s\n' "链路速率:" "${speed:-unknown}"
+    printf '%-22s %s\n' "NUMA 节点:" "$numa"
+
+    if ethtool -l "$nic" >/dev/null 2>&1; then
+      local max_combined cur_combined
+      max_combined="$(ethtool -l "$nic" 2>/dev/null | awk '
+        /Pre-set maximums:/ {sec=1; next}
+        /Current hardware settings:/ {sec=0}
+        sec && /Combined:/ {print $2; exit}
+      ')"
+      cur_combined="$(ethtool -l "$nic" 2>/dev/null | awk '
+        /Current hardware settings:/ {sec=1; next}
+        sec && /Combined:/ {print $2; exit}
+      ')"
+      printf '%-22s %s\n' "网卡通道信息:" "combined ${cur_combined:-unknown}/${max_combined:-unknown}"
+    fi
+
+    if ethtool -c "$nic" >/dev/null 2>&1; then
+      echo "coalesce:"
+      ethtool -c "$nic" 2>/dev/null | awk -F': ' '
+        /adaptive-rx:/ || /adaptive-tx:/ || /rx-usecs:/ || /tx-usecs:/ {
+          gsub(/^[ \t]+/, "", $1)
+          printf "  %-18s %s\n", $1 ":", $2
+        }
+      ' || true
+    fi
+
     echo "网卡错误信息:"
-    ethtool -S "$nic" 2>/dev/null | egrep 'rx_(missed|over|dropped)|tx_.*errors' | sed 's/^/  /' || true
+    ethtool -S "$nic" 2>/dev/null | awk -F': ' '
+      /rx_(missed|over|dropped)/ || /tx_.*errors/ {
+        gsub(/^[ \t]+/, "", $1)
+        printf "  %-26s %s\n", $1 ":", $2
+        found=1
+      }
+      END {
+        if (!found) print "  无明显错误计数"
+      }
+    ' || true
+
     echo "IRQ 分布:"
-    grep -i "$nic" /proc/interrupts | sed 's/^/  /' || true
+    awk -v dev="$nic" '
+      $0 ~ dev {
+        irq=$1
+        sub(":", "", irq)
+
+        sum=0
+        for (i=2; i<=NF; i++) {
+          if ($i ~ /^[0-9]+$/) sum += $i
+          else break
+        }
+
+        name=$NF
+        printf "  IRQ %-4s 总中断=%-12s 设备=%s\n", irq, sum, name
+        found=1
+      }
+      END {
+        if (!found) print "  未找到相关 IRQ"
+      }
+    ' /proc/interrupts || true
+
+    echo "IRQ 亲和性:"
+    {
+      found_irq=0
+      while read -r irq; do
+        [ -n "$irq" ] || continue
+        found_irq=1
+        if [ -r "/proc/irq/$irq/smp_affinity_list" ]; then
+          printf '  IRQ %-4s CPU=%s\n' "$irq" "$(cat "/proc/irq/$irq/smp_affinity_list" 2>/dev/null)"
+        else
+          printf '  IRQ %-4s CPU=%s\n' "$irq" "unknown"
+        fi
+      done < <(awk -v dev="$nic" '$0 ~ dev {gsub(":", "", $1); print $1}' /proc/interrupts)
+
+      [ "$found_irq" -eq 1 ] || echo "  未找到相关 IRQ"
+    } || true
+
     if command -v tc >/dev/null 2>&1; then
       echo "qdisc:"
       tc qdisc show dev "$nic" 2>/dev/null | sed 's/^/  /' || true
+      printf '%-22s %s\n' "leaf fq 统计:" "$(
+        tc qdisc show dev "$nic" 2>/dev/null | awk '
+          / parent / {total++}
+          / parent / && / fq / {fq++}
+          END {printf "%d/%d", fq+0, total+0}
+        '
+      )"
     fi
   fi
 
   if command -v systemctl >/dev/null 2>&1; then
     if systemctl cat live-relay-nic-tuning.service >/dev/null 2>&1; then
-      echo "网卡调优服务:        $(systemctl is-enabled live-relay-nic-tuning.service 2>/dev/null || echo disabled)"
+      printf '%-22s %s\n' "网卡调优服务:" "$(systemctl is-enabled live-relay-nic-tuning.service 2>/dev/null || echo disabled)"
     else
-      echo "网卡调优服务:        disabled"
+      printf '%-22s %s\n' "网卡调优服务:" "disabled"
     fi
   fi
-  echo "sysctl 文件:          $SYSCTL_FILE"
+
+  printf '%-22s %s\n' "sysctl 文件:" "$SYSCTL_FILE"
+  printf '%-22s %s\n' "网卡环境文件:" "$NIC_ENV_FILE"
   echo "========================================="
   echo
 }
