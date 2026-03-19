@@ -21,14 +21,14 @@ BLUE='\033[36m'
 GRAY='\033[90m'
 RESET='\033[0m'
 
-log()  { echo -e "${GREEN}[INFO]${RESET} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${RESET} $*"; }
-err()  { echo -e "${RED}[ERR ]${RESET} $*"; }
-info() { echo -e "${BLUE}[....]${RESET} $*"; }
+log()  { echo -e "${GREEN}[信息]${RESET} $*"; }
+warn() { echo -e "${YELLOW}[警告]${RESET} $*"; }
+err()  { echo -e "${RED}[错误]${RESET} $*"; }
+info() { echo -e "${BLUE}[处理中]${RESET} $*"; }
 
 need_root() {
   if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-    err "Please run as root."
+    err "请使用 root 权限运行。"
     exit 1
   fi
 }
@@ -101,13 +101,13 @@ ensure_cmd() {
   fi
 
   pm=$(detect_pm)
-  warn "$cmd not found. Trying to install it automatically."
+  warn "$cmd 未找到，正在尝试自动安装。"
   case "$pm" in
     apt) install_packages "$pm" "$pkg_apt" ;;
     dnf|yum) install_packages "$pm" "$pkg_rpm" ;;
     pacman) install_packages "$pm" "$pkg_pac" ;;
     zypper) install_packages "$pm" "$pkg_zypper" ;;
-    *) err "No supported package manager found. Please install $cmd manually."; return 1 ;;
+    *) err "未找到受支持的包管理器，请手动安装 $cmd。"; return 1 ;;
   esac
 
   command -v "$cmd" >/dev/null 2>&1
@@ -138,12 +138,12 @@ restore_last_backup() {
   local last
   last=$(last_backup_path)
   if [ -z "$last" ] || [ ! -f "$last" ]; then
-    err "No sysctl backup found."
+    err "未找到 sysctl 备份。"
     return 1
   fi
   cp -a "$last" "$SYSCTL_FILE"
   sysctl -p >/dev/null 2>&1 || true
-  log "Restored $SYSCTL_FILE from $last"
+  log "已将 $SYSCTL_FILE 从 $last 恢复。"
 }
 
 current_cc_algo() {
@@ -164,7 +164,7 @@ pick_cc_algo() {
     echo bbr
     return 0
   fi
-  warn "BBR is not available on this kernel. Falling back to current congestion control: $current"
+  warn "当前内核不支持 BBR，回退到当前拥塞控制算法：$current"
   echo "$current"
 }
 
@@ -197,7 +197,7 @@ EOF_SYSTEMD
 write_profile_1() {
   local cc="$1"
   cat > "$SYSCTL_FILE" <<EOF_PROFILE1
-# ===== High-Capacity Live Relay Stable Profile =====
+# ===== 高容量 Live Relay 稳定配置 =====
 
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = $cc
@@ -234,14 +234,14 @@ vm.overcommit_memory = 1
 vm.dirty_ratio = 5
 vm.dirty_background_ratio = 2
 
-# ===== End Stable Profile =====
+# ===== 稳定配置结束 =====
 EOF_PROFILE1
 }
 
 write_profile_2() {
   local cc="$1"
   cat > "$SYSCTL_FILE" <<EOF_PROFILE2
-# ===== High-Capacity Live Relay Hyper Profile =====
+# ===== 高容量 Live Relay 极限配置 =====
 
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = $cc
@@ -278,16 +278,16 @@ vm.overcommit_memory = 1
 vm.dirty_ratio = 5
 vm.dirty_background_ratio = 2
 
-# ===== End Hyper Profile =====
+# ===== 极限配置结束 =====
 EOF_PROFILE2
 }
 
 apply_sysctl_file() {
   if sysctl -p >"$SYSCTL_LOG" 2>&1; then
-    log "sysctl applied successfully."
+    log "sysctl 参数应用成功。"
     return 0
   fi
-  err "sysctl apply failed. Rolling back. Check $SYSCTL_LOG"
+  err "sysctl 应用失败，正在回滚。请检查 $SYSCTL_LOG"
   restore_last_backup || true
   return 1
 }
@@ -314,14 +314,14 @@ build_nic_helper() {
 set -euo pipefail
 
 NIC_ENV_FILE="/etc/live-relay-nic.env"
-[ -f "$NIC_ENV_FILE" ] || { echo "Missing $NIC_ENV_FILE"; exit 1; }
+[ -f "$NIC_ENV_FILE" ] || { echo "缺少 $NIC_ENV_FILE"; exit 1; }
 # shellcheck disable=SC1090
 source "$NIC_ENV_FILE"
 
 DEV="${DEV:-}"
-[ -n "$DEV" ] || { echo "DEV is empty"; exit 1; }
-command -v ethtool >/dev/null 2>&1 || { echo "ethtool not found"; exit 1; }
-command -v python3 >/dev/null 2>&1 || { echo "python3 not found"; exit 1; }
+[ -n "$DEV" ] || { echo "DEV 为空"; exit 1; }
+command -v ethtool >/dev/null 2>&1 || { echo "未找到 ethtool"; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "未找到 python3"; exit 1; }
 
 _expand_cpulist() {
   python3 - "$1" <<'PY'
@@ -375,7 +375,7 @@ _get_default_cpus() {
 }
 
 if ! ip link show "$DEV" >/dev/null 2>&1; then
-  echo "Interface $DEV not found"
+  echo "网卡接口 $DEV 不存在"
   exit 1
 fi
 
@@ -387,7 +387,7 @@ if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet irqbalanc
 fi
 
 mapfile -t BASE_CPUS < <(_get_default_cpus | sort -n)
-[ "${#BASE_CPUS[@]}" -gt 0 ] || { echo "No online CPUs found"; exit 1; }
+[ "${#BASE_CPUS[@]}" -gt 0 ] || { echo "未找到在线 CPU"; exit 1; }
 
 TARGET_CPUS="${TARGET_CPUS:-0}"
 if [ "$TARGET_CPUS" -le 0 ] || [ "$TARGET_CPUS" -gt "${#BASE_CPUS[@]}" ]; then
@@ -400,8 +400,8 @@ for ((i=0; i<TARGET_CPUS; i++)); do
 done
 CPU_CSV=$(IFS=,; echo "${CPUS[*]}")
 
-echo "NIC: $DEV"
-echo "Target CPUs: $CPU_CSV"
+echo "网卡: $DEV"
+echo "目标 CPU: $CPU_CSV"
 
 if ethtool -l "$DEV" >/dev/null 2>&1; then
   MAX_COMBINED=$(ethtool -l "$DEV" 2>/dev/null | awk '
@@ -482,7 +482,7 @@ if [ "${#RXQS[@]}" -gt 0 ]; then
   fi
 fi
 
-echo "NIC tuning applied to $DEV"
+echo "网卡调优已应用到 $DEV"
 EOF_HELPER
   chmod +x "$NIC_HELPER"
 }
@@ -490,7 +490,7 @@ EOF_HELPER
 build_nic_service() {
   cat > "$NIC_SERVICE" <<'EOF_SERVICE'
 [Unit]
-Description=Live Relay NIC Tuning
+Description=Live Relay 网卡调优
 Wants=network-online.target
 After=network-online.target
 
@@ -547,9 +547,9 @@ EOF_NICENV
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload
     systemctl enable --now live-relay-nic-tuning.service >/dev/null 2>&1 || true
-    log "Mode 2 NIC tuning service installed and enabled."
+    log "模式 2 的网卡调优服务已安装并启用。"
   else
-    warn "systemd not found. NIC tuning was applied now but will not persist after reboot."
+    warn "未找到 systemd，网卡调优已立即生效，但重启后不会持久保留。"
   fi
 }
 
@@ -557,7 +557,7 @@ apply_profile() {
   local mode="$1" cc backup nic
   cc=$(pick_cc_algo)
   backup=$(backup_sysctl)
-  log "Backup saved to $backup"
+  log "备份已保存到 $backup"
   write_limits
 
   case "$mode" in
@@ -569,7 +569,7 @@ apply_profile() {
       write_profile_2 "$cc"
       ;;
     *)
-      err "Unknown mode: $mode"
+      err "未知模式：$mode"
       return 1
       ;;
   esac
@@ -578,14 +578,14 @@ apply_profile() {
 
   if [ "$mode" = "2" ]; then
     if is_container; then
-      warn "Container environment detected. Skipping NIC queue/IRQ tuning and persistence."
+      warn "检测到容器环境，跳过网卡队列 / IRQ 调优及持久化。"
       nic=""
     else
       nic=$(select_nic_noninteractive || true)
       if [ -z "$nic" ]; then
-        warn "Could not detect NIC automatically. Skipping NIC queue tuning. Set NIC=eth0 and rerun mode 2 if needed."
+        warn "无法自动检测网卡，跳过网卡队列调优。如有需要请设置 NIC=eth0 后重新执行模式 2。"
       else
-        log "Using NIC: $nic"
+        log "使用网卡：$nic"
         setup_mode2_persistence "$nic"
       fi
     fi
@@ -615,38 +615,38 @@ show_status() {
   nic="${saved_nic:-$(default_nic)}"
 
   echo
-  echo "================ STATUS ================"
-  echo "Profile:              $profile"
-  echo "Congestion control:   $cc"
-  echo "Available CC:         $avail"
-  echo "Default qdisc:        $qdisc"
-  echo "somaxconn:            $(sysctl -n net.core.somaxconn 2>/dev/null || true)"
-  echo "tcp_max_syn_backlog:  $(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || true)"
-  echo "netdev_max_backlog:   $(sysctl -n net.core.netdev_max_backlog 2>/dev/null || true)"
-  echo "fs.file-max:          $(sysctl -n fs.file-max 2>/dev/null || true)"
-  echo "tcp_rmem:             $(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || true)"
-  echo "tcp_wmem:             $(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || true)"
-  echo "udp_rmem_min:         $(sysctl -n net.ipv4.udp_rmem_min 2>/dev/null || true)"
-  echo "udp_wmem_min:         $(sysctl -n net.ipv4.udp_wmem_min 2>/dev/null || true)"
-  echo "Detected NIC:         ${nic:-none}"
+  echo "================ 状态信息 ================"
+  echo "当前配置:            $profile"
+  echo "拥塞控制算法:        $cc"
+  echo "可用拥塞控制:        $avail"
+  echo "默认 qdisc:          $qdisc"
+  echo "somaxconn:           $(sysctl -n net.core.somaxconn 2>/dev/null || true)"
+  echo "tcp_max_syn_backlog: $(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || true)"
+  echo "netdev_max_backlog:  $(sysctl -n net.core.netdev_max_backlog 2>/dev/null || true)"
+  echo "fs.file-max:         $(sysctl -n fs.file-max 2>/dev/null || true)"
+  echo "tcp_rmem:            $(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || true)"
+  echo "tcp_wmem:            $(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || true)"
+  echo "udp_rmem_min:        $(sysctl -n net.ipv4.udp_rmem_min 2>/dev/null || true)"
+  echo "udp_wmem_min:        $(sysctl -n net.ipv4.udp_wmem_min 2>/dev/null || true)"
+  echo "检测到的网卡:        ${nic:-none}"
 
   if [ -n "$nic" ] && command -v ethtool >/dev/null 2>&1 && ip link show "$nic" >/dev/null 2>&1; then
-    echo "NIC channels:"
+    echo "网卡通道信息:"
     ethtool -l "$nic" 2>/dev/null | sed 's/^/  /' || true
-    echo "NIC errors:"
+    echo "网卡错误信息:"
     ethtool -S "$nic" 2>/dev/null | egrep 'rx_(missed|over|dropped)|tx_.*errors' | sed 's/^/  /' || true
-    echo "IRQ distribution:"
+    echo "IRQ 分布:"
     grep -i "$nic" /proc/interrupts | sed 's/^/  /' || true
   fi
 
   if command -v systemctl >/dev/null 2>&1; then
     if systemctl list-unit-files 2>/dev/null | grep -q '^live-relay-nic-tuning.service'; then
-      echo "NIC tuning service:   $(systemctl is-enabled live-relay-nic-tuning.service 2>/dev/null || echo disabled)"
+      echo "网卡调优服务:        $(systemctl is-enabled live-relay-nic-tuning.service 2>/dev/null || echo disabled)"
     else
-      echo "NIC tuning service:   disabled"
+      echo "网卡调优服务:        disabled"
     fi
   fi
-  echo "========================================"
+  echo "========================================="
   echo
 }
 
@@ -657,7 +657,7 @@ rollback_everything() {
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
-  log "Rollback complete. Some NIC/IRQ runtime settings may still need a reboot to fully reset."
+  log "回滚完成。部分网卡 / IRQ 运行时设置可能仍需重启后才能完全恢复。"
   show_status
 }
 
@@ -665,13 +665,13 @@ show_menu() {
   clear || true
   cat <<'EOF_MENU'
 =====================================================
- Live Relay Tuner
+ Live Relay 调优工具
 =====================================================
- 1) Stable high-capacity profile
- 2) Hyper profile + NIC queue/IRQ/RPS/XPS tuning
- 3) Show status
- 4) Roll back to last backup
- 0) Exit
+ 1) 稳定高容量配置
+ 2) 极限配置 + 网卡队列 / IRQ / RPS / XPS 调优
+ 3) 查看当前状态
+ 4) 回滚到上一次备份
+ 0) 退出
 =====================================================
 EOF_MENU
 }
@@ -700,13 +700,13 @@ main() {
     "")
       ;;
     *)
-      warn "Unknown argument: $choice"
+      warn "未知参数：$choice"
       ;;
   esac
 
   while true; do
     show_menu
-    read -r -p "Select [0-4]: " choice
+    read -r -p "请选择 [0-4]：" choice
     case "$choice" in
       1)
         apply_profile 1
@@ -718,7 +718,7 @@ main() {
         ;;
       3)
         show_status
-        read -r -p "Press Enter to continue..." _tmp
+        read -r -p "按回车键继续..." _tmp
         ;;
       4)
         rollback_everything
@@ -728,7 +728,7 @@ main() {
         exit 0
         ;;
       *)
-        warn "Invalid selection."
+        warn "无效选项。"
         sleep 1
         ;;
     esac
