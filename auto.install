@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="4.1.0-smart-auto"
+VERSION="4.1.1-smart-auto"
 WORKDIR="/opt/live-relay-smart-auto"
 NIC_ENV_FILE="/etc/live-relay-smart-auto.env"
 NIC_HELPER="/usr/local/sbin/live-relay-smart-auto-apply.sh"
@@ -141,10 +141,6 @@ mem_total_kb() {
 
 mem_total_gb() {
   awk '/MemTotal:/ {printf "%d\n", int(($2 + 1048575) / 1048576)}' /proc/meminfo
-}
-
-cpu_online_count() {
-  nproc 2>/dev/null || awk '/^processor/ {c++} END {print c+0}' /proc/cpuinfo
 }
 
 current_cc_algo() {
@@ -528,6 +524,19 @@ _get_current_combined() {
   '
 }
 
+_get_current_rings() {
+  ethtool -g "$DEV" 2>/dev/null | awk '
+    /Current hardware settings:/ {sec=1; next}
+    sec && $1 == "RX:" {rx=$2}
+    sec && $1 == "TX:" {tx=$2}
+    END {
+      if (rx == "") rx="unknown"
+      if (tx == "") tx="unknown"
+      printf "%s/%s\n", rx, tx
+    }
+  '
+}
+
 _get_topology_lists() {
   local nic_node use_ht
   nic_node=$(_get_nic_numa_node)
@@ -738,9 +747,9 @@ _apply_queue_count() {
 }
 
 _apply_max_rings() {
-  local rxmax txmax
+  local rxmax txmax cur
   [ "${MAX_RINGS:-1}" = "1" ] || return 0
-  ethtool -g "$DEV" >/dev/null 2>&1 || return 0
+  ethtool -g "$DEV" >/dev/null 2>&1 || { echo "unsupported"; return 0; }
 
   rxmax=$(ethtool -g "$DEV" 2>/dev/null | awk '
     /Pre-set maximums:/ {sec=1; next}
@@ -756,20 +765,25 @@ _apply_max_rings() {
   if [ -n "$rxmax" ] && [ -n "$txmax" ] && [ "$rxmax" != "n/a" ] && [ "$txmax" != "n/a" ] && [ "$rxmax" -gt 0 ] && [ "$txmax" -gt 0 ]; then
     ethtool -G "$DEV" rx "$rxmax" tx "$txmax" >/dev/null 2>&1 || true
   fi
+
+  cur=$(_get_current_rings || true)
+  echo "${cur:-unknown}"
 }
 
 _apply_coalesce() {
-  local mode speed rx tx driver
+  local mode speed rx tx driver cur_rx cur_tx
   mode="${COALESCE_MODE:-auto}"
   speed=$(_get_link_speed)
   driver=$(_get_driver)
 
-  ethtool -c "$DEV" >/dev/null 2>&1 || return 0
+  ethtool -c "$DEV" >/dev/null 2>&1 || { echo "unsupported"; return 0; }
 
   case "$mode" in
     adaptive)
       if ethtool -C "$DEV" adaptive-rx on adaptive-tx on >/dev/null 2>&1; then
-        echo "adaptive"
+        cur_rx=$(ethtool -c "$DEV" 2>/dev/null | awk -F': ' '/rx-usecs:/ {print $2; exit}')
+        cur_tx=$(ethtool -c "$DEV" 2>/dev/null | awk -F': ' '/tx-usecs:/ {print $2; exit}')
+        echo "actual:${cur_rx:-unknown}/${cur_tx:-unknown}"
       else
         echo "unsupported"
       fi
@@ -791,18 +805,18 @@ _apply_coalesce() {
 
   if [ "$mode" = "auto" ] || [ -z "$rx" ] || [ -z "$tx" ]; then
     case "$speed" in
-      ''|*[!0-9]*) rx=8; tx=8 ;;
+      ''|*[!0-9]*) rx=4; tx=4 ;;
       *)
         if [ "$speed" -ge 100000 ]; then
           rx=4; tx=4
         elif [ "$speed" -ge 50000 ]; then
-          rx=6; tx=6
+          rx=4; tx=4
         elif [ "$speed" -ge 25000 ]; then
-          rx=8; tx=8
+          rx=6; tx=6
         elif [ "$speed" -ge 10000 ]; then
-          rx=12; tx=12
+          rx=4; tx=4
         else
-          rx=16; tx=16
+          rx=8; tx=8
         fi
         ;;
     esac
@@ -816,7 +830,11 @@ _apply_coalesce() {
   esac
 
   ethtool -C "$DEV" rx-usecs "$rx" tx-usecs "$tx" >/dev/null 2>&1 || true
-  echo "fixed:${rx}/${tx}"
+
+  cur_rx=$(ethtool -c "$DEV" 2>/dev/null | awk -F': ' '/rx-usecs:/ {print $2; exit}')
+  cur_tx=$(ethtool -c "$DEV" 2>/dev/null | awk -F': ' '/tx-usecs:/ {print $2; exit}')
+
+  echo "actual:${cur_rx:-unknown}/${cur_tx:-unknown}"
 }
 
 _force_fq_qdisc() {
@@ -881,8 +899,8 @@ CPUS=("${SELECTED_CPUS[@]}")
 [ "${#CPUS[@]}" -gt 0 ] || { echo "未选出目标 CPU"; exit 1; }
 
 CPU_CSV=$(IFS=,; echo "${CPUS[*]}")
+RING_RESULT=$(_apply_max_rings)
 COALESCE_RESULT=$(_apply_coalesce)
-_apply_max_rings
 
 mapfile -t RXQS < <(find "/sys/class/net/$DEV/queues" -maxdepth 1 -type d -name 'rx-*' | sort -V)
 mapfile -t TXQS < <(find "/sys/class/net/$DEV/queues" -maxdepth 1 -type d -name 'tx-*' | sort -V)
@@ -950,6 +968,7 @@ printf '链路速率: %s Mb/s\n' "$(_get_link_speed || echo unknown)"
 printf 'NUMA 节点: %s\n' "$(_get_nic_numa_node || echo -1)"
 printf '目标 CPU: %s\n' "$CPU_CSV"
 printf '目标队列: %s\n' "$TARGET_QUEUES"
+printf 'ring: %s\n' "$RING_RESULT"
 printf 'coalesce: %s\n' "$COALESCE_RESULT"
 printf '网卡调优已应用到 %s\n' "$DEV"
 EOF_HELPER
@@ -1127,10 +1146,33 @@ show_status() {
       printf '%-22s %s\n' "网卡通道信息:" "combined ${cur_combined:-unknown}/${max_combined:-unknown}"
     fi
 
+    if ethtool -g "$nic" >/dev/null 2>&1; then
+      local cur_rx cur_tx max_rx max_tx
+      max_rx="$(ethtool -g "$nic" 2>/dev/null | awk '
+        /Pre-set maximums:/ {sec=1; next}
+        /Current hardware settings:/ {sec=0}
+        sec && $1 == "RX:" {print $2; exit}
+      ')"
+      max_tx="$(ethtool -g "$nic" 2>/dev/null | awk '
+        /Pre-set maximums:/ {sec=1; next}
+        /Current hardware settings:/ {sec=0}
+        sec && $1 == "TX:" {print $2; exit}
+      ')"
+      cur_rx="$(ethtool -g "$nic" 2>/dev/null | awk '
+        /Current hardware settings:/ {sec=1; next}
+        sec && $1 == "RX:" {print $2; exit}
+      ')"
+      cur_tx="$(ethtool -g "$nic" 2>/dev/null | awk '
+        /Current hardware settings:/ {sec=1; next}
+        sec && $1 == "TX:" {print $2; exit}
+      ')"
+      printf '%-22s %s\n' "ring 信息:" "rx ${cur_rx:-unknown}/${max_rx:-unknown}, tx ${cur_tx:-unknown}/${max_tx:-unknown}"
+    fi
+
     if ethtool -c "$nic" >/dev/null 2>&1; then
       echo "coalesce:"
       ethtool -c "$nic" 2>/dev/null | awk -F': ' '
-        /adaptive-rx:/ || /adaptive-tx:/ || /rx-usecs:/ || /tx-usecs:/ {
+        /Adaptive RX:/ || /Adaptive TX:/ || /rx-usecs:/ || /tx-usecs:/ {
           gsub(/^[ \t]+/, "", $1)
           printf "  %-18s %s\n", $1 ":", $2
         }
@@ -1228,7 +1270,7 @@ cleanup_smart() {
 
   if grep -qaE 'lxc|container' /proc/1/environ 2>/dev/null || grep -qaE 'lxc|container' /proc/1/cgroup 2>/dev/null; then
     echo -e "${YELLOW}⚠️ 检测到当前环境为 LXC 容器，已完成基础清理，但跳过 HIA BBR 优化。${RESET}"
-    return
+    return 0
   fi
 
   echo -e "${GREEN}[信息] 正在注入 HIA 极限基线参数...${RESET}"
