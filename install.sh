@@ -122,7 +122,11 @@ backup_sysctl() {
   else
     touch "$backup"
   fi
+
   ln -sfn "$backup" "$BACKUP_DIR/latest"
+
+  ls -1t "$BACKUP_DIR"/sysctl.conf.* 2>/dev/null | awk 'NR>3' | xargs -r rm -f
+
   echo "$backup"
 }
 
@@ -189,7 +193,7 @@ DefaultTasksMax=infinity
 EOF_SYSTEMD
 
   ulimit -SHn 1048576 || true
-  if command -v systemctl >/dev/null 2>&1; then
+  
     systemctl daemon-reexec >/dev/null 2>&1 || systemctl daemon-reload >/dev/null 2>&1 || true
   fi
 }
@@ -639,13 +643,13 @@ show_status() {
     grep -i "$nic" /proc/interrupts | sed 's/^/  /' || true
   fi
 
-  if command -v systemctl >/dev/null 2>&1; then
-    if systemctl list-unit-files 2>/dev/null | grep -q '^live-relay-nic-tuning.service'; then
-      echo "网卡调优服务:        $(systemctl is-enabled live-relay-nic-tuning.service 2>/dev/null || echo disabled)"
-    else
-      echo "网卡调优服务:        disabled"
-    fi
+if command -v systemctl >/dev/null 2>&1; then
+  if systemctl cat live-relay-nic-tuning.service >/dev/null 2>&1; then
+    echo "网卡调优服务:        $(systemctl is-enabled live-relay-nic-tuning.service 2>/dev/null || echo disabled)"
+  else
+    echo "网卡调优服务:        disabled"
   fi
+fi
   echo "========================================="
   echo
 }
