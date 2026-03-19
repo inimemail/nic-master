@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="2.1.0"
 WORKDIR="/opt/live-relay-tuner"
-BACKUP_DIR="$WORKDIR/backups"
 NIC_ENV_FILE="/etc/live-relay-nic.env"
 NIC_HELPER="/usr/local/sbin/live-relay-nic-apply.sh"
 NIC_SERVICE="/etc/systemd/system/live-relay-nic-tuning.service"
 LIMITS_FILE="/etc/security/limits.d/99-live-relay.conf"
 SYSTEMD_LIMIT_DIR="/etc/systemd/system.conf.d"
 SYSTEMD_LIMIT_FILE="$SYSTEMD_LIMIT_DIR/99-live-relay.conf"
-SYSCTL_FILE="/etc/sysctl.conf"
+SYSCTL_DIR="/etc/sysctl.d"
+SYSCTL_FILE="$SYSCTL_DIR/99-live-relay.conf"
 STATE_FILE="$WORKDIR/state.env"
 SYSCTL_LOG="/tmp/live-relay-sysctl.log"
 
@@ -18,7 +18,6 @@ GREEN='\033[32m'
 YELLOW='\033[33m'
 RED='\033[31m'
 BLUE='\033[36m'
-GRAY='\033[90m'
 RESET='\033[0m'
 
 log()  { echo -e "${GREEN}[信息]${RESET} $*"; }
@@ -33,7 +32,7 @@ need_root() {
   fi
 }
 
-mkdir -p "$WORKDIR" "$BACKUP_DIR"
+mkdir -p "$WORKDIR" "$SYSCTL_DIR"
 
 is_container() {
   grep -qaE 'docker|lxc|container|kubepods' /proc/1/cgroup 2>/dev/null || \
@@ -91,6 +90,12 @@ ensure_cmd() {
     ip)
       pkg_apt="iproute2"; pkg_rpm="iproute"; pkg_pac="iproute2"; pkg_zypper="iproute2"
       ;;
+    tc)
+      pkg_apt="iproute2"; pkg_rpm="iproute"; pkg_pac="iproute2"; pkg_zypper="iproute2"
+      ;;
+    modprobe)
+      pkg_apt="kmod"; pkg_rpm="kmod"; pkg_pac="kmod"; pkg_zypper="kmod"
+      ;;
     *)
       return 0
       ;;
@@ -111,43 +116,6 @@ ensure_cmd() {
   esac
 
   command -v "$cmd" >/dev/null 2>&1
-}
-
-backup_sysctl() {
-  local ts backup
-  ts=$(date +%Y%m%d_%H%M%S)
-  backup="$BACKUP_DIR/sysctl.conf.$ts"
-  if [ -f "$SYSCTL_FILE" ]; then
-    cp -a "$SYSCTL_FILE" "$backup"
-  else
-    touch "$backup"
-  fi
-
-  ln -sfn "$backup" "$BACKUP_DIR/latest"
-
-  ls -1t "$BACKUP_DIR"/sysctl.conf.* 2>/dev/null | awk 'NR>3' | xargs -r rm -f
-
-  echo "$backup"
-}
-
-last_backup_path() {
-  if [ -L "$BACKUP_DIR/latest" ]; then
-    readlink -f "$BACKUP_DIR/latest"
-    return 0
-  fi
-  ls -1t "$BACKUP_DIR"/sysctl.conf.* 2>/dev/null | head -n1 || true
-}
-
-restore_last_backup() {
-  local last
-  last=$(last_backup_path)
-  if [ -z "$last" ] || [ ! -f "$last" ]; then
-    err "未找到 sysctl 备份。"
-    return 1
-  fi
-  cp -a "$last" "$SYSCTL_FILE"
-  sysctl -p >/dev/null 2>&1 || true
-  log "已将 $SYSCTL_FILE 从 $last 恢复。"
 }
 
 current_cc_algo() {
@@ -198,101 +166,187 @@ EOF_SYSTEMD
   fi
 }
 
+sysctl_proc_path() {
+  echo "/proc/sys/${1//./\/}"
+}
+
+begin_sysctl_file() {
+  local title="$1"
+  cat > "$SYSCTL_FILE" <<EOF_HEADER
+# =====================================================
+# Live Relay Tuner $VERSION
+# $title
+# 自动生成，请勿手工编辑
+# =====================================================
+EOF_HEADER
+}
+
+append_if_supported() {
+  local key="$1" value="$2" path
+  path=$(sysctl_proc_path "$key")
+  if [ -e "$path" ]; then
+    printf '%s = %s\n' "$key" "$value" >> "$SYSCTL_FILE"
+  else
+    warn "当前内核未提供 $key，已跳过。"
+  fi
+}
+
+mem_total_kb() {
+  awk '/MemTotal:/ {print $2; exit}' /proc/meminfo
+}
+
+calc_conntrack_buckets() {
+  local mem_kb buckets
+  mem_kb=$(mem_total_kb)
+  buckets=$(( mem_kb / 16 ))
+  [ "$buckets" -lt 1024 ] && buckets=1024
+  [ "$buckets" -gt 262144 ] && buckets=262144
+  echo "$buckets"
+}
+
+calc_conntrack_max() {
+  local buckets multiplier
+  buckets=$(calc_conntrack_buckets)
+  multiplier="${CONNTRACK_MULTIPLIER:-2}"
+  case "$multiplier" in
+    ''|*[!0-9]*) multiplier=2 ;;
+  esac
+  [ "$multiplier" -lt 1 ] && multiplier=1
+  echo $(( buckets * multiplier ))
+}
+
+append_common_sysctls() {
+  local cc="$1"
+  append_if_supported net.core.default_qdisc fq
+  append_if_supported net.ipv4.tcp_congestion_control "$cc"
+
+  append_if_supported net.ipv4.tcp_mtu_probing 1
+  append_if_supported net.ipv4.tcp_slow_start_after_idle 0
+  append_if_supported net.ipv4.tcp_limit_output_bytes 1048576
+  append_if_supported net.ipv4.tcp_notsent_lowat 131072
+  append_if_supported net.ipv4.ip_local_port_range "10000 65535"
+
+  append_if_supported net.ipv4.tcp_fin_timeout 10
+  append_if_supported net.ipv4.tcp_keepalive_time 300
+  append_if_supported net.ipv4.tcp_keepalive_intvl 30
+  append_if_supported net.ipv4.tcp_keepalive_probes 5
+
+  append_if_supported vm.swappiness 1
+  append_if_supported vm.overcommit_memory 1
+  append_if_supported vm.dirty_background_bytes 67108864
+  append_if_supported vm.dirty_bytes 268435456
+}
+
+append_stable_sysctls() {
+  append_if_supported net.core.somaxconn 32768
+  append_if_supported net.ipv4.tcp_max_syn_backlog 32768
+  append_if_supported net.core.netdev_max_backlog 32768
+  append_if_supported net.core.netdev_budget 300
+  append_if_supported net.core.netdev_budget_usecs 4000
+  append_if_supported net.core.dev_weight 128
+
+  append_if_supported fs.file-max 2097152
+
+  append_if_supported net.core.rmem_max 67108864
+  append_if_supported net.core.wmem_max 67108864
+  append_if_supported net.core.rmem_default 1048576
+  append_if_supported net.core.wmem_default 262144
+  append_if_supported net.core.optmem_max 262144
+
+  append_if_supported net.ipv4.tcp_rmem "4096 262144 67108864"
+  append_if_supported net.ipv4.tcp_wmem "4096 65536 67108864"
+  append_if_supported net.ipv4.udp_rmem_min 131072
+}
+
+append_hyper_sysctls() {
+  append_if_supported net.core.somaxconn 65535
+  append_if_supported net.ipv4.tcp_max_syn_backlog 65535
+  append_if_supported net.core.netdev_max_backlog 131072
+  append_if_supported net.core.netdev_budget 600
+  append_if_supported net.core.netdev_budget_usecs 8000
+  append_if_supported net.core.dev_weight 256
+  append_if_supported net.core.dev_weight_rx_bias 2
+  append_if_supported net.core.dev_weight_tx_bias 2
+
+  append_if_supported fs.file-max 4194304
+
+  append_if_supported net.core.rmem_max 134217728
+  append_if_supported net.core.wmem_max 134217728
+  append_if_supported net.core.rmem_default 2097152
+  append_if_supported net.core.wmem_default 524288
+  append_if_supported net.core.optmem_max 262144
+
+  append_if_supported net.ipv4.tcp_rmem "4096 262144 134217728"
+  append_if_supported net.ipv4.tcp_wmem "4096 131072 134217728"
+  append_if_supported net.ipv4.udp_rmem_min 524288
+
+  append_if_supported net.ipv4.tcp_limit_output_bytes 2097152
+  append_if_supported net.ipv4.tcp_notsent_lowat 131072
+
+  append_if_supported vm.dirty_background_bytes 134217728
+  append_if_supported vm.dirty_bytes 536870912
+
+  if [ "${ENABLE_BUSY_POLL:-0}" = "1" ]; then
+    append_if_supported net.core.busy_read 50
+    append_if_supported net.core.busy_poll 50
+  fi
+}
+
+append_conntrack_sysctls() {
+  local profile="$1" buckets max_est ct_max
+  modprobe nf_conntrack >/dev/null 2>&1 || true
+
+  if [ ! -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
+    warn "未检测到 nf_conntrack，跳过连接跟踪调优。"
+    return 0
+  fi
+
+  buckets=$(calc_conntrack_buckets)
+  ct_max=$(calc_conntrack_max)
+
+  append_if_supported net.netfilter.nf_conntrack_buckets "$buckets"
+  append_if_supported net.netfilter.nf_conntrack_max "$ct_max"
+
+  if [ "$profile" = "2" ]; then
+    max_est=1800
+  else
+    max_est=7200
+  fi
+
+  append_if_supported net.netfilter.nf_conntrack_tcp_timeout_established "$max_est"
+  append_if_supported net.netfilter.nf_conntrack_tcp_timeout_syn_recv 20
+  append_if_supported net.netfilter.nf_conntrack_tcp_timeout_syn_sent 20
+  append_if_supported net.netfilter.nf_conntrack_tcp_timeout_unacknowledged 60
+  append_if_supported net.netfilter.nf_conntrack_tcp_timeout_fin_wait 20
+  append_if_supported net.netfilter.nf_conntrack_tcp_timeout_time_wait 30
+  append_if_supported net.netfilter.nf_conntrack_tcp_timeout_close_wait 30
+  append_if_supported net.netfilter.nf_conntrack_tcp_timeout_close 10
+  append_if_supported net.netfilter.nf_conntrack_udp_timeout 15
+  append_if_supported net.netfilter.nf_conntrack_udp_timeout_stream 120
+}
+
 write_profile_1() {
   local cc="$1"
-  cat > "$SYSCTL_FILE" <<EOF_PROFILE1
-# ===== 高容量 Live Relay 稳定配置 =====
-
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = $cc
-
-net.core.somaxconn = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
-net.core.netdev_max_backlog = 65535
-fs.file-max = 2097152
-
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.core.rmem_default = 8388608
-net.core.wmem_default = 8388608
-net.core.optmem_max = 262144
-
-net.ipv4.tcp_rmem = 4096 1048576 67108864
-net.ipv4.tcp_wmem = 4096 1048576 67108864
-net.ipv4.udp_rmem_min = 262144
-net.ipv4.udp_wmem_min = 262144
-
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_tw_reuse = 2
-net.ipv4.ip_local_port_range = 10240 65535
-
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_keepalive_time = 300
-net.ipv4.tcp_keepalive_intvl = 30
-net.ipv4.tcp_keepalive_probes = 5
-
-vm.swappiness = 0
-vm.overcommit_memory = 1
-vm.dirty_ratio = 5
-vm.dirty_background_ratio = 2
-
-# ===== 稳定配置结束 =====
-EOF_PROFILE1
+  begin_sysctl_file "稳定高容量配置"
+  append_common_sysctls "$cc"
+  append_stable_sysctls
+  append_conntrack_sysctls 1
 }
 
 write_profile_2() {
   local cc="$1"
-  cat > "$SYSCTL_FILE" <<EOF_PROFILE2
-# ===== 高容量 Live Relay 极限配置 =====
-
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = $cc
-
-net.core.somaxconn = 131072
-net.ipv4.tcp_max_syn_backlog = 131072
-net.core.netdev_max_backlog = 131072
-fs.file-max = 4194304
-
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.core.rmem_default = 16777216
-net.core.wmem_default = 16777216
-net.core.optmem_max = 262144
-
-net.ipv4.tcp_rmem = 4096 1048576 134217728
-net.ipv4.tcp_wmem = 4096 1048576 134217728
-net.ipv4.udp_rmem_min = 524288
-net.ipv4.udp_wmem_min = 524288
-
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_tw_reuse = 2
-net.ipv4.ip_local_port_range = 10240 65535
-
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_keepalive_time = 300
-net.ipv4.tcp_keepalive_intvl = 30
-net.ipv4.tcp_keepalive_probes = 5
-
-vm.swappiness = 0
-vm.overcommit_memory = 1
-vm.dirty_ratio = 5
-vm.dirty_background_ratio = 2
-
-# ===== 极限配置结束 =====
-EOF_PROFILE2
+  begin_sysctl_file "极限低延迟直播配置"
+  append_common_sysctls "$cc"
+  append_hyper_sysctls
+  append_conntrack_sysctls 2
 }
 
 apply_sysctl_file() {
-  if sysctl -p >"$SYSCTL_LOG" 2>&1; then
+  if sysctl -p "$SYSCTL_FILE" >"$SYSCTL_LOG" 2>&1; then
     log "sysctl 参数应用成功。"
     return 0
   fi
-  err "sysctl 应用失败，正在回滚。请检查 $SYSCTL_LOG"
-  restore_last_backup || true
+  err "sysctl 应用失败，请检查 $SYSCTL_LOG"
   return 1
 }
 
@@ -558,10 +612,9 @@ EOF_NICENV
 }
 
 apply_profile() {
-  local mode="$1" cc backup nic
+  local mode="$1" cc nic
   cc=$(pick_cc_algo)
-  backup=$(backup_sysctl)
-  log "备份已保存到 $backup"
+  log "选择拥塞控制算法：$cc"
   write_limits
 
   case "$mode" in
@@ -602,8 +655,7 @@ apply_profile() {
 }
 
 show_status() {
-  local nic cc qdisc avail state profile saved_nic
-  state=""
+  local nic cc qdisc avail profile saved_nic
   profile="unknown"
   saved_nic=""
   if [ -f "$STATE_FILE" ]; then
@@ -627,11 +679,16 @@ show_status() {
   echo "somaxconn:           $(sysctl -n net.core.somaxconn 2>/dev/null || true)"
   echo "tcp_max_syn_backlog: $(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || true)"
   echo "netdev_max_backlog:  $(sysctl -n net.core.netdev_max_backlog 2>/dev/null || true)"
+  echo "netdev_budget:       $(sysctl -n net.core.netdev_budget 2>/dev/null || true)"
+  echo "budget_usecs:        $(sysctl -n net.core.netdev_budget_usecs 2>/dev/null || true)"
   echo "fs.file-max:         $(sysctl -n fs.file-max 2>/dev/null || true)"
   echo "tcp_rmem:            $(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || true)"
   echo "tcp_wmem:            $(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || true)"
   echo "udp_rmem_min:        $(sysctl -n net.ipv4.udp_rmem_min 2>/dev/null || true)"
-  echo "udp_wmem_min:        $(sysctl -n net.ipv4.udp_wmem_min 2>/dev/null || true)"
+  echo "tcp_limit_output:    $(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null || true)"
+  echo "tcp_notsent_lowat:   $(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || true)"
+  echo "conntrack_count:     $(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo n/a)"
+  echo "conntrack_max:       $(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo n/a)"
   echo "检测到的网卡:        ${nic:-none}"
 
   if [ -n "$nic" ] && command -v ethtool >/dev/null 2>&1 && ip link show "$nic" >/dev/null 2>&1; then
@@ -641,28 +698,31 @@ show_status() {
     ethtool -S "$nic" 2>/dev/null | egrep 'rx_(missed|over|dropped)|tx_.*errors' | sed 's/^/  /' || true
     echo "IRQ 分布:"
     grep -i "$nic" /proc/interrupts | sed 's/^/  /' || true
+    if command -v tc >/dev/null 2>&1; then
+      echo "qdisc:"
+      tc qdisc show dev "$nic" 2>/dev/null | sed 's/^/  /' || true
+    fi
   fi
 
-if command -v systemctl >/dev/null 2>&1; then
-  if systemctl cat live-relay-nic-tuning.service >/dev/null 2>&1; then
-    echo "网卡调优服务:        $(systemctl is-enabled live-relay-nic-tuning.service 2>/dev/null || echo disabled)"
-  else
-    echo "网卡调优服务:        disabled"
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl cat live-relay-nic-tuning.service >/dev/null 2>&1; then
+      echo "网卡调优服务:        $(systemctl is-enabled live-relay-nic-tuning.service 2>/dev/null || echo disabled)"
+    else
+      echo "网卡调优服务:        disabled"
+    fi
   fi
-fi
+  echo "sysctl 文件:          $SYSCTL_FILE"
   echo "========================================="
   echo
 }
 
-rollback_everything() {
-  restore_last_backup || true
+cleanup_live_relay() {
   remove_mode2_service
-  rm -f "$LIMITS_FILE" "$SYSTEMD_LIMIT_FILE" "$STATE_FILE"
+  rm -f "$LIMITS_FILE" "$SYSTEMD_LIMIT_FILE" "$SYSCTL_FILE" "$STATE_FILE"
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
-  log "回滚完成。部分网卡 / IRQ 运行时设置可能仍需重启后才能完全恢复。"
-  show_status
+  warn "已删除本工具生成的配置文件。已写入内核的运行时参数不会自动恢复，建议重启主机或手动执行 sysctl --system 后按需校正。"
 }
 
 show_menu() {
@@ -672,9 +732,9 @@ show_menu() {
  Live Relay 调优工具
 =====================================================
  1) 稳定高容量配置
- 2) 极限配置 + 网卡队列 / IRQ / RPS / XPS 调优
+ 2) 极限低延迟直播配置 + 网卡队列 / IRQ / RPS / XPS 调优
  3) 查看当前状态
- 4) 回滚到上一次备份
+ 4) 清理本工具生成的配置文件
  0) 退出
 =====================================================
 EOF_MENU
@@ -682,6 +742,7 @@ EOF_MENU
 
 main() {
   need_root
+  ensure_cmd modprobe || true
 
   local choice="${1:-}"
   case "$choice" in
@@ -697,8 +758,8 @@ main() {
       show_status
       return 0
       ;;
-    4|rollback)
-      rollback_everything
+    4|cleanup|remove)
+      cleanup_live_relay
       return 0
       ;;
     "")
@@ -725,7 +786,7 @@ main() {
         read -r -p "按回车键继续..." _tmp
         ;;
       4)
-        rollback_everything
+        cleanup_live_relay
         break
         ;;
       0)
