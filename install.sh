@@ -193,7 +193,7 @@ DefaultTasksMax=infinity
 EOF_SYSTEMD
 
   ulimit -SHn 1048576 || true
-  
+  if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reexec >/dev/null 2>&1 || systemctl daemon-reload >/dev/null 2>&1 || true
   fi
 }
