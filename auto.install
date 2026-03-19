@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="5.2.0-smart-hw-deterministic"
+VERSION="5.2.1-smart-hw-deterministic"
 WORKDIR="/opt/live-relay-smart-auto"
 NIC_ENV_FILE="/etc/live-relay-smart-auto.env"
 NIC_HELPER="/usr/local/sbin/live-relay-smart-auto-apply.sh"
@@ -240,7 +240,6 @@ calc_somaxconn() {
 
 write_limits() {
   mkdir -p "$(dirname "$LIMITS_FILE")" "$SYSTEMD_LIMIT_DIR"
-  # 严格锁定在内核默认天花板 1048576，彻底规避 Operation not permitted
   cat > "$LIMITS_FILE" <<'EOF_LIMITS'
 * soft nofile 1048576
 * hard nofile 1048576
@@ -574,7 +573,6 @@ _calc_auto_queue_base() {
   max_combined=$(_get_max_combined)
   worker_phys="${#WORKER_PRIMARY_CPUS[@]}"
   
-  # 绝对确定性：直接将队列映射到可用物理核上限，不再受流量探测影响
   target_q=$worker_phys
   [ "$target_q" -eq 0 ] && target_q=$(nproc 2>/dev/null || echo 8)
 
@@ -650,7 +648,6 @@ _apply_coalesce() {
   driver=$(_get_driver)
   ethtool -c "$DEV" >/dev/null 2>&1 || return 0
 
-  # 拦截中断风暴：强制绝对确定性的阈值
   ethtool -C "$DEV" adaptive-rx off adaptive-tx off >/dev/null 2>&1 || true
 
   case "$speed" in
@@ -675,7 +672,6 @@ _apply_coalesce() {
 _force_fq_qdisc() {
   [ "${FORCE_FQ:-1}" = "1" ] || return 0
   modprobe sch_fq >/dev/null 2>&1 || true
-  # 致命修复：针对多队列网卡，必须指定 mq 为根排队规则，防止 TX 拥塞单通道
   tc qdisc replace dev "$DEV" root mq >/dev/null 2>&1 || true
 }
 
@@ -906,7 +902,10 @@ IRQBALANCE_POLICY=${IRQBALANCE_POLICY:-auto}
 FLOW_CONTROL_MODE=${FLOW_CONTROL_MODE:-keep}
 FORCE_FQ=${FORCE_FQ:-1}
 EOF_NICENV
+
+  info "正在编译内核级十六进制位掩码，保证物理核绑定的绝对精度 (预计耗时 1-3 秒，请稍候)..."
   "$NIC_HELPER"
+
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload
     systemctl enable --now live-relay-smart-auto.service >/dev/null 2>&1 || true
@@ -984,12 +983,13 @@ show_status() {
       ethtool -c "$nic" 2>/dev/null | awk -F': ' '/Adaptive RX:/ || /Adaptive TX:/ || /rx-usecs:/ || /tx-usecs:/ { gsub(/^[ \t]+/, "", $1); printf "  %-18s %s\n", $1 ":", $2 }' || true
     fi
 
-    echo "IRQ 分布 (示例前几项):"
-    awk -v dev="$nic" '$0 ~ dev { irq=$1; sub(":", "", irq); sum=0; for(i=2;i<=NF;i++){ if($i~/^[0-9]+$/) sum+=$i; else break } printf "  IRQ %-4s 总中断=%-12s 设备=%s\n", irq, sum, $NF; found++; if(found>=5) exit }' /proc/interrupts || true
+    # 毫无保留地展示全部 IRQ 中断分布
+    echo "IRQ 分布 (全量展示):"
+    awk -v dev="$nic" '$0 ~ dev { irq=$1; sub(":", "", irq); sum=0; for(i=2;i<=NF;i++){ if($i~/^[0-9]+$/) sum+=$i; else break } printf "  IRQ %-4s 总中断=%-12s 设备=%s\n", irq, sum, $NF }' /proc/interrupts || true
 
     if command -v tc >/dev/null 2>&1; then
       echo "qdisc:"
-      tc qdisc show dev "$nic" 2>/dev/null | head -n 5 | sed 's/^/  /' || true
+      tc qdisc show dev "$nic" 2>/dev/null | sed 's/^/  /' || true
       printf '%-22s %s\n' "leaf fq 统计:" "$(tc qdisc show dev "$nic" 2>/dev/null | awk '/ parent / {total++} / parent / && / fq / {fq++} END {printf "%d/%d", fq+0, total+0}')"
     fi
   fi
@@ -1070,7 +1070,7 @@ show_menu() {
   clear || true
   cat <<'EOF_MENU'
 =====================================================
- Live Relay 智能自适调优工具（硬件感知版）
+ Live Relay 智能自适调优工具
 =====================================================
  1) 智能极限低延迟模式
  2) 查看当前状态
@@ -1079,7 +1079,6 @@ show_menu() {
 =====================================================
 EOF_MENU
 }
-
 
 main() {
   need_root
