@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="4.0.0-smart-auto"
+VERSION="4.1.0-smart-auto"
 WORKDIR="/opt/live-relay-smart-auto"
 NIC_ENV_FILE="/etc/live-relay-smart-auto.env"
 NIC_HELPER="/usr/local/sbin/live-relay-smart-auto-apply.sh"
@@ -32,7 +32,9 @@ need_root() {
   fi
 }
 
-mkdir -p "$WORKDIR" "$SYSCTL_DIR"
+ensure_base_dirs() {
+  mkdir -p "$WORKDIR" "$SYSCTL_DIR"
+}
 
 is_container() {
   grep -qaE 'docker|lxc|container|kubepods' /proc/1/cgroup 2>/dev/null || \
@@ -96,6 +98,9 @@ ensure_cmd() {
     modprobe)
       pkg_apt="kmod"; pkg_rpm="kmod"; pkg_pac="kmod"; pkg_zypper="kmod"
       ;;
+    awk|sed|grep|find|sort|cat)
+      return 0
+      ;;
     *)
       return 0
       ;;
@@ -138,6 +143,10 @@ mem_total_gb() {
   awk '/MemTotal:/ {printf "%d\n", int(($2 + 1048575) / 1048576)}' /proc/meminfo
 }
 
+cpu_online_count() {
+  nproc 2>/dev/null || awk '/^processor/ {c++} END {print c+0}' /proc/cpuinfo
+}
+
 current_cc_algo() {
   sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo cubic
 }
@@ -150,12 +159,14 @@ pick_cc_algo() {
     echo bbr
     return 0
   fi
+
   modprobe tcp_bbr >/dev/null 2>&1 || true
   available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
   if echo " $available " | grep -q ' bbr '; then
     echo bbr
     return 0
   fi
+
   warn "当前内核不支持 BBR，回退到当前拥塞控制算法：$current"
   echo "$current"
 }
@@ -198,7 +209,7 @@ calc_file_max() {
 calc_netdev_backlog() {
   local speed="$1"
   case "$speed" in
-    ''|*[!0-9]*) echo 131072 ;;
+    ''|*[!0-9]*) echo 65536 ;;
     *)
       if [ "$speed" -ge 100000 ]; then
         echo 262144
@@ -261,6 +272,7 @@ calc_somaxconn() {
 
 write_limits() {
   mkdir -p "$(dirname "$LIMITS_FILE")" "$SYSTEMD_LIMIT_DIR"
+
   cat > "$LIMITS_FILE" <<'EOF_LIMITS'
 * soft nofile 1048576
 * hard nofile 1048576
@@ -342,6 +354,7 @@ EOF_HEADER
   append_if_supported net.ipv4.tcp_rmem "4096 262144 134217728"
   append_if_supported net.ipv4.tcp_wmem "4096 131072 134217728"
   append_if_supported net.ipv4.udp_rmem_min 524288
+  append_if_supported net.ipv4.udp_wmem_min 524288
 
   append_if_supported net.ipv4.tcp_mtu_probing 1
   append_if_supported net.ipv4.tcp_slow_start_after_idle 0
@@ -433,6 +446,7 @@ source "$NIC_ENV_FILE"
 
 DEV="${DEV:-}"
 [ -n "$DEV" ] || { echo "DEV 为空"; exit 1; }
+
 command -v ethtool >/dev/null 2>&1 || { echo "未找到 ethtool"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "未找到 python3"; exit 1; }
 command -v ip >/dev/null 2>&1 || { echo "未找到 ip"; exit 1; }
@@ -473,8 +487,8 @@ if not h:
 else:
     groups = []
     while h:
-      groups.append(h[-8:].rjust(8, "0"))
-      h = h[:-8]
+        groups.append(h[-8:].rjust(8, "0"))
+        h = h[:-8]
     print(",".join(reversed(groups)))
 PY
 }
@@ -527,11 +541,12 @@ _get_topology_lists() {
         socket = $3
         node = $4
         key = socket ":" core
-        is_local = (want_node >= 0 && node == want_node) ? 1 : 0
+
+        if (want_node < 0) is_local = 1
+        else is_local = (node == want_node) ? 1 : 0
 
         if (!(key in first_cpu)) {
           first_cpu[key] = cpu
-          first_local[key] = is_local
           if (is_local) local_primary[++lp] = cpu
           else remote_primary[++rp] = cpu
         } else {
@@ -560,6 +575,8 @@ _load_topology() {
   LOCAL_SIBLING=()
   REMOTE_PRIMARY=()
   REMOTE_SIBLING=()
+
+  local line kind cpu
   for line in "${TOPOLOGY_LINES[@]}"; do
     kind="${line%% *}"
     cpu="${line#* }"
@@ -573,10 +590,11 @@ _load_topology() {
 }
 
 _calc_auto_queue_base() {
-  local speed driver base max_combined
+  local speed driver base max_combined cpu_count
   speed=$(_get_link_speed)
   driver=$(_get_driver)
   max_combined=$(_get_max_combined)
+  cpu_count=$(nproc 2>/dev/null || echo 8)
 
   case "$speed" in
     ''|*[!0-9]*)
@@ -613,6 +631,8 @@ _calc_auto_queue_base() {
       ;;
   esac
 
+  [ "$base" -gt "$cpu_count" ] && base="$cpu_count"
+  [ "$base" -lt 1 ] && base=1
   echo "$base"
 }
 
@@ -646,15 +666,18 @@ _pick_target_queues() {
     target="$queue_cap"
   fi
 
-  if [ "$use_ht" = "0" ] && [ "$target" -gt "$total_non_ht" ]; then
+  if [ "$use_ht" = "0" ] && [ "$target" -gt "$total_non_ht" ] && [ "$total_non_ht" -gt 0 ]; then
     target="$total_non_ht"
   fi
 
   if [ "$use_ht" = "auto" ]; then
-    if [ "$target" -gt "$local_primary_count" ] && [ "$local_sibling_count" -eq 0 ] && [ "$remote_primary_count" -gt 0 ]; then
+    if [ "$local_primary_count" -gt 0 ] && [ "$target" -gt "$local_primary_count" ] && [ "$local_sibling_count" -eq 0 ] && [ "$remote_primary_count" -gt 0 ]; then
       target="$local_primary_count"
-      [ "$target" -lt 1 ] && target=1
     fi
+  fi
+
+  if [ "$local_primary_count" -eq 0 ] && [ "$total_non_ht" -gt 0 ] && [ "$target" -gt "$total_non_ht" ]; then
+    target="$total_non_ht"
   fi
 
   [ "$target" -lt 1 ] && target=1
@@ -697,7 +720,7 @@ _build_cpu_list() {
 }
 
 _apply_queue_count() {
-  local target="$1" max_combined
+  local target="$1" max_combined cur
   if ethtool -l "$DEV" >/dev/null 2>&1; then
     max_combined=$(_get_max_combined)
     if [ -n "$max_combined" ] && [ "$max_combined" != "n/a" ] && [ "$max_combined" -gt 0 ]; then
@@ -705,7 +728,13 @@ _apply_queue_count() {
       ethtool -L "$DEV" combined "$target" >/dev/null 2>&1 || true
     fi
   fi
-  echo "$target"
+
+  if ethtool -x "$DEV" >/dev/null 2>&1; then
+    ethtool -X "$DEV" equal "$target" >/dev/null 2>&1 || true
+  fi
+
+  cur=$(_get_current_combined || true)
+  [ -n "$cur" ] && echo "$cur" || echo "$target"
 }
 
 _apply_max_rings() {
@@ -738,22 +767,29 @@ _apply_coalesce() {
   ethtool -c "$DEV" >/dev/null 2>&1 || return 0
 
   case "$mode" in
-    adaptive|auto)
+    adaptive)
       if ethtool -C "$DEV" adaptive-rx on adaptive-tx on >/dev/null 2>&1; then
         echo "adaptive"
-        return 0
+      else
+        echo "unsupported"
       fi
-      [ "$mode" = "adaptive" ] && { echo "unsupported"; return 0; }
+      return 0
       ;;
     off)
       echo "off"
       return 0
       ;;
+    fixed|auto|'')
+      ;;
+    *)
+      mode="auto"
+      ;;
   esac
 
   rx="${COALESCE_RX_USECS:-}"
   tx="${COALESCE_TX_USECS:-}"
-  if [ -z "$rx" ] || [ -z "$tx" ] || [ "$mode" = "auto" ]; then
+
+  if [ "$mode" = "auto" ] || [ -z "$rx" ] || [ -z "$tx" ]; then
     case "$speed" in
       ''|*[!0-9]*) rx=8; tx=8 ;;
       *)
@@ -799,6 +835,7 @@ _calc_rfs_total_flows() {
   local rxqs mem_gb total
   rxqs="$1"
   mem_gb=$(awk '/MemTotal:/ {printf "%d\n", int(($2 + 1048575) / 1048576)}' /proc/meminfo)
+
   if [ "$rxqs" -le 4 ]; then
     total=32768
   elif [ "$rxqs" -le 8 ]; then
@@ -808,6 +845,7 @@ _calc_rfs_total_flows() {
   else
     total=262144
   fi
+
   if [ "$mem_gb" -lt 16 ] && [ "$total" -gt 65536 ]; then
     total=65536
   fi
@@ -820,10 +858,17 @@ if ! ip link show "$DEV" >/dev/null 2>&1; then
 fi
 
 if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet irqbalance 2>/dev/null; then
-  if [ "${DISABLE_IRQBALANCE:-1}" = "1" ]; then
-    systemctl stop irqbalance >/dev/null 2>&1 || true
-    systemctl disable irqbalance >/dev/null 2>&1 || true
-  fi
+  case "${IRQBALANCE_POLICY:-keep}" in
+    disable)
+      if [ "${DISABLE_IRQBALANCE:-0}" = "1" ]; then
+        systemctl stop irqbalance >/dev/null 2>&1 || true
+        systemctl disable irqbalance >/dev/null 2>&1 || true
+      fi
+      ;;
+    keep|*)
+      :
+      ;;
+  esac
 fi
 
 TARGET_QUEUES=$(_pick_target_queues)
@@ -853,7 +898,7 @@ if [ "${#IRQS[@]}" -gt 0 ]; then
   done
 fi
 
-if [ "${#TXQS[@]}" -gt 1 ]; then
+if [ "${#TXQS[@]}" -gt 0 ]; then
   for ((i = 0; i < ${#TXQS[@]}; i++)); do
     CPU="${CPUS[$(( i % ${#CPUS[@]} ))]}"
     MASK=$(_cpulist_to_mask "$CPU")
@@ -871,9 +916,11 @@ if [ "${#RXQS[@]}" -gt 0 ]; then
       *[!0-9]*) TOTAL_FLOWS=$(_calc_rfs_total_flows "${#RXQS[@]}") ;;
       *) : ;;
     esac
+
     echo "$TOTAL_FLOWS" > /proc/sys/net/core/rps_sock_flow_entries || true
     PERQ=$(( TOTAL_FLOWS / ${#RXQS[@]} ))
     [ "$PERQ" -lt 1024 ] && PERQ=1024
+
     for ((i = 0; i < ${#RXQS[@]}; i++)); do
       IRQCPU="${CPUS[$(( i % ${#CPUS[@]} ))]}"
       OTHERS=()
@@ -889,6 +936,7 @@ if [ "${#RXQS[@]}" -gt 0 ]; then
   else
     for Q in "${RXQS[@]}"; do
       [ -w "$Q/rps_cpus" ] && echo 0 > "$Q/rps_cpus" || true
+      [ -w "$Q/rps_flow_cnt" ] && echo 0 > "$Q/rps_flow_cnt" || true
     done
     echo 0 > /proc/sys/net/core/rps_sock_flow_entries || true
   fi
@@ -905,6 +953,7 @@ printf '目标队列: %s\n' "$TARGET_QUEUES"
 printf 'coalesce: %s\n' "$COALESCE_RESULT"
 printf '网卡调优已应用到 %s\n' "$DEV"
 EOF_HELPER
+
   chmod +x "$NIC_HELPER"
 }
 
@@ -912,11 +961,12 @@ build_nic_service() {
   cat > "$NIC_SERVICE" <<'EOF_SERVICE'
 [Unit]
 Description=Live Relay Smart Auto NIC Tuning
-Wants=network-online.target
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
+EnvironmentFile=-/etc/live-relay-smart-auto.env
 ExecStart=/usr/local/sbin/live-relay-smart-auto-apply.sh
 RemainAfterExit=yes
 
@@ -935,6 +985,7 @@ select_nic_noninteractive() {
     echo "$nic"
     return 0
   fi
+
   nic=$(ip -o link show | awk -F': ' '$2 !~ /lo/ {print $2; exit}')
   if [ -n "$nic" ]; then
     echo "$nic"
@@ -945,6 +996,7 @@ select_nic_noninteractive() {
 
 setup_persistence() {
   local nic="$1"
+
   ensure_cmd ethtool
   ensure_cmd python3
   ensure_cmd ip
@@ -962,7 +1014,8 @@ TARGET_QUEUES=${TARGET_QUEUES:-auto}
 QUEUE_CAP=${QUEUE_CAP:-0}
 MAX_RINGS=${MAX_RINGS:-1}
 RFS_FLOW_ENTRIES=${RFS_FLOW_ENTRIES:-auto}
-DISABLE_IRQBALANCE=${DISABLE_IRQBALANCE:-1}
+DISABLE_IRQBALANCE=${DISABLE_IRQBALANCE:-0}
+IRQBALANCE_POLICY=${IRQBALANCE_POLICY:-keep}
 COALESCE_MODE=${COALESCE_MODE:-auto}
 COALESCE_RX_USECS=${COALESCE_RX_USECS:-}
 COALESCE_TX_USECS=${COALESCE_TX_USECS:-}
@@ -984,6 +1037,7 @@ apply_smart() {
   local cc nic
   cc=$(pick_cc_algo)
   log "选择拥塞控制算法：$cc"
+
   write_limits
   write_smart_profile "$cc"
   apply_sysctl_file
@@ -1008,6 +1062,7 @@ apply_smart() {
 show_status() {
   local nic cc qdisc avail saved_nic profile
   local driver speed numa
+
   saved_nic=""
   profile="unknown"
 
@@ -1038,6 +1093,7 @@ show_status() {
   printf '%-22s %s\n' "tcp_rmem:" "$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || true)"
   printf '%-22s %s\n' "tcp_wmem:" "$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || true)"
   printf '%-22s %s\n' "udp_rmem_min:" "$(sysctl -n net.ipv4.udp_rmem_min 2>/dev/null || true)"
+  printf '%-22s %s\n' "udp_wmem_min:" "$(sysctl -n net.ipv4.udp_wmem_min 2>/dev/null || true)"
   printf '%-22s %s\n' "tcp_limit_output:" "$(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null || true)"
   printf '%-22s %s\n' "tcp_notsent_lowat:" "$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || true)"
   printf '%-22s %s\n' "conntrack_count:" "$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo n/a)"
@@ -1083,7 +1139,7 @@ show_status() {
 
     echo "网卡错误信息:"
     ethtool -S "$nic" 2>/dev/null | awk -F': ' '
-      /rx_(missed|over|dropped)/ || /tx_.*errors/ {
+      /rx_(missed|over|dropped)/ || /tx_.*errors/ || /rx_no_buffer_count/ {
         gsub(/^[ \t]+/, "", $1)
         printf "  %-26s %s\n", $1 ":", $2
         found=1
@@ -1098,13 +1154,11 @@ show_status() {
       $0 ~ dev {
         irq=$1
         sub(":", "", irq)
-
         sum=0
         for (i=2; i<=NF; i++) {
           if ($i ~ /^[0-9]+$/) sum += $i
           else break
         }
-
         name=$NF
         printf "  IRQ %-4s 总中断=%-12s 设备=%s\n", irq, sum, name
         found=1
@@ -1159,11 +1213,17 @@ show_status() {
 }
 
 cleanup_smart() {
-  echo -e "${BLUE}[处理中] 正在清理专属配置并恢复基线...${RESET}"
+  info "正在清理 smart-auto 配置..."
   remove_service
   rm -f "$LIMITS_FILE" "$SYSTEMD_LIMIT_FILE" "$SYSCTL_FILE" "$STATE_FILE"
+
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+
+  if is_container; then
+    warn "检测到容器环境，已完成基础清理。"
+    return 0
   fi
 
   if grep -qaE 'lxc|container' /proc/1/environ 2>/dev/null || grep -qaE 'lxc|container' /proc/1/cgroup 2>/dev/null; then
@@ -1223,10 +1283,8 @@ vm.dirty_background_ratio = 5
 # ===== End HIA =====
 EOF
 
-  sysctl -p >/dev/null 2>&1 || true
-  
-  echo -e "${GREEN}清理完成！系统已强制回退并锁定至 HIA 全局高并发基线。${RESET}"
-  sleep 2
+  sysctl --system >/dev/null 2>&1 || true
+  log "清理完成，已回退HIA极限高并发。"
 }
 
 show_menu() {
@@ -1237,7 +1295,7 @@ show_menu() {
 =====================================================
  1) 智能极限低延迟模式
  2) 查看当前状态
- 3) 清理本配置回退HIA
+ 3) 清理配置回退HIA
  0) 退出
 =====================================================
 EOF_MENU
@@ -1245,6 +1303,7 @@ EOF_MENU
 
 main() {
   need_root
+  ensure_base_dirs
   ensure_cmd modprobe || true
 
   local choice="${1:-}"
