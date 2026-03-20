@@ -1121,7 +1121,7 @@ _apply_irq_affinity() {
       irq="${IRQS[$i]}"
       cpu="${IRQ_CPUS[$(( i % ${#IRQ_CPUS[@]} ))]}"
       if [ -w "/proc/irq/$irq/smp_affinity_list" ]; then
-        echo "$cpu" > "/proc/irq/$irq/smp_affinity_list" || true
+        echo "$cpu" > "/proc/irq/$irq/smp_affinity_list" 2>/dev/null || true
       fi
     done
   fi
@@ -1136,7 +1136,7 @@ _apply_xps() {
       [ "${#cpu_list[@]}" -gt 0 ] || continue
       csv=$(IFS=,; echo "${cpu_list[*]}")
       mask=$(_cpulist_to_mask "$csv")
-      [ -w "${TXQS[$i]}/xps_cpus" ] && echo "$mask" > "${TXQS[$i]}/xps_cpus" || true
+      [ -w "${TXQS[$i]}/xps_cpus" ] && echo "$mask" > "${TXQS[$i]}/xps_cpus" 2>/dev/null || true
     done
   fi
 }
@@ -1170,7 +1170,7 @@ _apply_rps_rfs() {
       *) : ;;
     esac
 
-    echo "$total_flows" > /proc/sys/net/core/rps_sock_flow_entries || true
+    echo "$total_flows" > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
     perq=$(( total_flows / ${#RXQS[@]} ))
     [ "$perq" -lt 1024 ] && perq=1024
 
@@ -1185,20 +1185,20 @@ _apply_rps_rfs() {
 
       csv=$(IFS=,; echo "${cpu_list[*]}")
       mask=$(_cpulist_to_mask "$csv")
-      [ -w "${RXQS[$i]}/rps_cpus" ] && echo "$mask" > "${RXQS[$i]}/rps_cpus" || true
-      [ -w "${RXQS[$i]}/rps_flow_cnt" ] && echo "$perq" > "${RXQS[$i]}/rps_flow_cnt" || true
+      [ -w "${RXQS[$i]}/rps_cpus" ] && echo "$mask" > "${RXQS[$i]}/rps_cpus" 2>/dev/null || true
+      [ -w "${RXQS[$i]}/rps_flow_cnt" ] && echo "$perq" > "${RXQS[$i]}/rps_flow_cnt" 2>/dev/null || true
     done
 
     if [ -e /proc/sys/net/core/flow_limit_cpu_bitmap ] && [ "${ENABLE_FLOW_LIMIT:-auto}" != "0" ] && [ "${ENABLE_FLOW_LIMIT:-auto}" != "off" ]; then
-      echo "$(_bitmap_for_all_workers)" > /proc/sys/net/core/flow_limit_cpu_bitmap || true
+      echo "$(_bitmap_for_all_workers)" > /proc/sys/net/core/flow_limit_cpu_bitmap 2>/dev/null || true
     fi
   else
     for Q in "${RXQS[@]}"; do
-      [ -w "$Q/rps_cpus" ] && echo 0 > "$Q/rps_cpus" || true
-      [ -w "$Q/rps_flow_cnt" ] && echo 0 > "$Q/rps_flow_cnt" || true
+      [ -w "$Q/rps_cpus" ] && echo 0 > "$Q/rps_cpus" 2>/dev/null || true
+      [ -w "$Q/rps_flow_cnt" ] && echo 0 > "$Q/rps_flow_cnt" 2>/dev/null || true
     done
-    echo 0 > /proc/sys/net/core/rps_sock_flow_entries || true
-    [ -e /proc/sys/net/core/flow_limit_cpu_bitmap ] && echo 0 > /proc/sys/net/core/flow_limit_cpu_bitmap || true
+    echo 0 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+    [ -e /proc/sys/net/core/flow_limit_cpu_bitmap ] && echo 0 > /proc/sys/net/core/flow_limit_cpu_bitmap 2>/dev/null || true
   fi
 }
 
