@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="5.3.1-udp-optimized-stateless"
+VERSION="5.3.0-smart-hw-udp-aware"
 WORKDIR="/opt/live-relay-smart-auto"
 NIC_ENV_FILE="/etc/live-relay-smart-auto.env"
 NIC_HELPER="/usr/local/sbin/live-relay-smart-auto-apply.sh"
@@ -424,13 +424,12 @@ write_smart_profile() {
   cat > "$SYSCTL_FILE" <<EOF_HEADER
 # =====================================================
 # Live Relay Smart Auto Tuner $VERSION
-# 确定性硬件感知 + UDP 友好调度 (无状态纯净版)
+# 确定性硬件感知 + UDP 友好调度
 # 自动生成，请勿手工编辑
 # =====================================================
 EOF_HEADER
 
-  # 核心修正：使用 fq_codel 完美吸收 UDP 大突发
-  append_if_supported net.core.default_qdisc fq_codel
+  append_if_supported net.core.default_qdisc fq
   append_if_supported net.ipv4.tcp_congestion_control "$cc"
 
   append_if_supported net.core.somaxconn "$somax"
@@ -445,11 +444,10 @@ EOF_HEADER
 
   append_if_supported fs.file-max "$filemax"
 
-  # 核心修正：极度放宽网络栈的基础读写池，保障 UDP 收发畅通
-  append_if_supported net.core.rmem_default 8388608
-  append_if_supported net.core.wmem_default 8388608
   append_if_supported net.core.rmem_max 134217728
   append_if_supported net.core.wmem_max 134217728
+  append_if_supported net.core.rmem_default 2097152
+  append_if_supported net.core.wmem_default 524288
   append_if_supported net.core.optmem_max 262144
 
   append_if_supported net.ipv4.tcp_rmem "4096 262144 134217728"
@@ -964,25 +962,20 @@ _apply_coalesce() {
   echo "actual:${actual_rx:-unknown}/${actual_tx:-unknown}"
 }
 
-# 核心修正：应用防突发截断的 fq_codel 算法
-_force_udp_optimized_qdisc() {
+_force_fq_qdisc() {
   [ "${FORCE_FQ:-1}" = "1" ] || return 0
-  modprobe sch_fq_codel >/dev/null 2>&1 || true
+  modprobe sch_fq >/dev/null 2>&1 || true
 
-  local txq_count i
+  local txq_count
   txq_count=$(find "/sys/class/net/$DEV/queues" -maxdepth 1 -type d -name 'tx-*' 2>/dev/null | awk 'END {print NR + 0}')
 
   tc qdisc del dev "$DEV" root >/dev/null 2>&1 || true
   if [ "$txq_count" -gt 1 ]; then
-    if tc qdisc replace dev "$DEV" root handle 1: mq >/dev/null 2>&1; then
-      for ((i = 1; i <= txq_count; i++)); do
-        tc qdisc replace dev "$DEV" parent 1:"$i" fq_codel limit 10240 flows 1024 >/dev/null 2>&1 || true
-      done
-    else
-      tc qdisc replace dev "$DEV" root fq_codel limit 10240 flows 1024 >/dev/null 2>&1 || true
-    fi
+    tc qdisc add dev "$DEV" root mq >/dev/null 2>&1 || \
+    tc qdisc replace dev "$DEV" root mq >/dev/null 2>&1 || \
+    tc qdisc replace dev "$DEV" root fq >/dev/null 2>&1 || true
   else
-    tc qdisc replace dev "$DEV" root fq_codel limit 10240 flows 1024 >/dev/null 2>&1 || true
+    tc qdisc replace dev "$DEV" root fq >/dev/null 2>&1 || true
   fi
 }
 
@@ -1175,7 +1168,7 @@ mapfile -t IRQS < <(awk -v dev="$DEV" '$0 ~ dev {gsub(":", "", $1); print $1}' /
 _apply_irq_affinity
 _apply_xps
 _apply_rps_rfs
-_force_udp_optimized_qdisc
+_force_fq_qdisc
 
 WORKER_CSV=$(IFS=,; echo "${WORKER_CPUS[*]}")
 IRQ_CSV=$(IFS=,; echo "${IRQ_CPUS[*]}")
@@ -1501,11 +1494,11 @@ show_status() {
     if command -v tc >/dev/null 2>&1; then
       echo "qdisc:"
       tc qdisc show dev "$nic" 2>/dev/null | sed 's/^/  /' || true
-      printf '%-22s %s\n' "leaf qdisc 统计:" "$(
+      printf '%-22s %s\n' "leaf fq 统计:" "$(
         tc qdisc show dev "$nic" 2>/dev/null | awk '
           / parent / {total++}
-          / parent / && / fq_codel / {fq++}
-          END {printf "%d/%d (fq_codel)", fq+0, total+0}
+          / parent / && / fq / {fq++}
+          END {printf "%d/%d", fq+0, total+0}
         '
       )"
     fi
