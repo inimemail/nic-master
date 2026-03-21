@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.3.6-srt-proxy-stable"
+VERSION="1.3.7-srt-proxy-robust"
 WORKDIR="/opt/live-relay-srt-smart"
 SRC_DIR="/usr/local/src"
 ENV_FILE="/etc/live-relay-srt-smart.env"
@@ -178,9 +178,18 @@ ensure_build_deps() {
   pm="$(detect_pm)"
 
   case "$pm" in
-    apt) 
-      # 核心加固：强制包含 build-essential 和 libc6-dev，免疫 autoremove 造成的编译链断裂
-      install_packages "$pm" ca-certificates wget curl tar pkg-config cmake make gcc g++ libssl-dev tcl build-essential libc6-dev 
+    apt)
+      info "正在刷新 APT 源并强制修复/重装核心编译工具链 (规避云厂商残缺镜像)..."
+      DEBIAN_FRONTEND=noninteractive apt-get update -y || true
+      
+      # 第一步：正常安装/修复编译链基础依赖
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-missing build-essential gcc g++ cpp libc6-dev
+      
+      # 第二步：强制重装，物理覆盖底层残缺的 libgcc 文件
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall build-essential gcc g++ cpp libc6-dev || true
+      
+      # 第三步：安装 SRT 其他依赖
+      install_packages "$pm" ca-certificates wget curl tar pkg-config cmake make libssl-dev tcl
       ;;
     dnf) install_packages "$pm" ca-certificates wget curl tar pkgconf-pkg-config cmake make gcc gcc-c++ openssl-devel tcl ;;
     yum) install_packages "$pm" epel-release || true; install_packages "$pm" ca-certificates wget curl tar pkgconfig cmake make gcc gcc-c++ openssl-devel tcl ;;
