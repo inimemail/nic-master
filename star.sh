@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.3.1-srt-proxy-stable"
+VERSION="1.3.2-srt-proxy-stable"
 WORKDIR="/opt/live-relay-srt-smart"
 SRC_DIR="/usr/local/src"
 ENV_FILE="/etc/live-relay-srt-smart.env"
@@ -261,27 +261,57 @@ check_srt_version() {
   echo "$ver"
 }
 
+# 版本比对函数：如果 $1 < $2，返回 0 (真)
+version_lt() {
+  [ "$1" = "$2" ] && return 1
+  [ "$(printf '%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]
+}
+
 ensure_srt_installed() {
-  local current_ver lowest
+  local current_ver
+  local need_compile=0
+
+  # 1. 检查系统中是否已有安装
   if command -v srt-live-transmit >/dev/null 2>&1; then
     current_ver=$(check_srt_version "$(command -v srt-live-transmit)")
-    log "检测到已安装 srt-live-transmit (版本: ${current_ver})。"
-    
-    lowest="$(printf '%s\n' "$current_ver" "$SRT_VERSION" | sort -V | head -n1)"
-    if [ "$current_ver" != "0.0.0" ] && [ "$lowest" = "$current_ver" ] && [ "$current_ver" != "$SRT_VERSION" ]; then
-      warn "当前 SRT 版本 ($current_ver) 低于目标版本 ($SRT_VERSION)，若遇性能瓶颈，建议清理后重装以触发源码编译。"
+    if [ "$current_ver" != "0.0.0" ]; then
+      if version_lt "$current_ver" "$SRT_VERSION"; then
+        warn "检测到当前已安装的 SRT 版本 ($current_ver) 低于目标版本 ($SRT_VERSION)。"
+        info "准备切入源码编译模式进行强覆盖升级..."
+        need_compile=1
+      else
+        log "已安装的 SRT 版本 ($current_ver) 达标，跳过安装环节。"
+        return 0
+      fi
     fi
-    return 0
   fi
 
-  if try_install_srt_from_repo; then
+  # 2. 尝试包管理器安装 (如果未触发强制编译)
+  if [ "$need_compile" -eq 0 ]; then
+    if try_install_srt_from_repo; then
+      current_ver=$(check_srt_version "$(command -v srt-live-transmit)")
+      if [ "$current_ver" != "0.0.0" ]; then
+        if version_lt "$current_ver" "$SRT_VERSION"; then
+          warn "包管理器提供的版本太老 ($current_ver)，拒绝使用此残次版本。"
+          info "准备切入源码编译模式进行兜底升级..."
+          need_compile=1
+        else
+          log "已通过包管理器成功安装达标的 SRT 版本 ($current_ver)。"
+          return 0
+        fi
+      fi
+    else
+      warn "包管理器安装未成功或软件源不存在，切换至源码编译兜底..."
+      need_compile=1
+    fi
+  fi
+
+  # 3. 终极源码编译兜底覆盖
+  if [ "$need_compile" -eq 1 ]; then
+    build_install_srt_from_source
     current_ver=$(check_srt_version "$(command -v srt-live-transmit)")
-    log "已通过包管理器成功安装 SRT (版本: ${current_ver})。"
-    return 0
+    log "源码升级完成，当前 SRT 版本: $current_ver。"
   fi
-
-  warn "包管理器安装未成功或源不存在，切换至源码编译兜底..."
-  build_install_srt_from_source
 }
 
 find_srt_bin() {
@@ -504,7 +534,6 @@ show_status() {
   local env_type systemd_state mem cpu srt_bin run_mode enabled active pid="" current_ver="unknown"
   local rt_status="Disabled"
   
-  # 用于状态显示的变量，优先读配置文件，若不存在则读取当前环境作为预演
   local disp_srt_host="${PROXY_SRT_HOST:-0.0.0.0}"
   local disp_srt_port="${PROXY_SRT_PORT:-10001}"
   local disp_udp_host="${LOCAL_UDP_HOST:-127.0.0.1}"
@@ -526,7 +555,6 @@ show_status() {
   enabled="disabled"
   active="inactive"
 
-  # 强一致性逻辑：运行状态只从写死的 ENV_FILE 中读取
   if [ -f "$ENV_FILE" ]; then
     # shellcheck disable=SC1090
     source "$ENV_FILE"
@@ -600,7 +628,7 @@ show_menu() {
   clear || true
   cat <<'EOF_MENU'
 =====================================================
- Live Relay SRT 代理管控工具
+ Live Relay SRT 代理管控工具 (稳定版)
 =====================================================
  1) 部署 / 启动 SRT 代理隧道
  2) 查看当前运行状态
