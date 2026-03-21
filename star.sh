@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.3.2-srt-proxy-stable"
+VERSION="1.3.5-srt-proxy-stable"
 WORKDIR="/opt/live-relay-srt-smart"
 SRC_DIR="/usr/local/src"
 ENV_FILE="/etc/live-relay-srt-smart.env"
@@ -14,9 +14,9 @@ PID_FILE="${WORKDIR}/srt-proxy.pid"
 
 SRT_VERSION="${SRT_VERSION:-1.5.3}"
 LOCAL_UDP_HOST="${LOCAL_UDP_HOST:-127.0.0.1}"
-LOCAL_UDP_PORT="${LOCAL_UDP_PORT:-10000}"
+LOCAL_UDP_PORT="${LOCAL_UDP_PORT:-60000}"
 PROXY_SRT_HOST="${PROXY_SRT_HOST:-0.0.0.0}"
-PROXY_SRT_PORT="${PROXY_SRT_PORT:-10001}"
+PROXY_SRT_PORT="${PROXY_SRT_PORT:-60001}"
 LATENCY_MS="${LATENCY_MS:-200}"
 BUFFER_BYTES="${BUFFER_BYTES:-8388608}"
 ENABLE_RT_SCHED="${ENABLE_RT_SCHED:-auto}"
@@ -261,7 +261,6 @@ check_srt_version() {
   echo "$ver"
 }
 
-# 版本比对函数：如果 $1 < $2，返回 0 (真)
 version_lt() {
   [ "$1" = "$2" ] && return 1
   [ "$(printf '%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]
@@ -271,7 +270,6 @@ ensure_srt_installed() {
   local current_ver
   local need_compile=0
 
-  # 1. 检查系统中是否已有安装
   if command -v srt-live-transmit >/dev/null 2>&1; then
     current_ver=$(check_srt_version "$(command -v srt-live-transmit)")
     if [ "$current_ver" != "0.0.0" ]; then
@@ -286,7 +284,6 @@ ensure_srt_installed() {
     fi
   fi
 
-  # 2. 尝试包管理器安装 (如果未触发强制编译)
   if [ "$need_compile" -eq 0 ]; then
     if try_install_srt_from_repo; then
       current_ver=$(check_srt_version "$(command -v srt-live-transmit)")
@@ -306,7 +303,6 @@ ensure_srt_installed() {
     fi
   fi
 
-  # 3. 终极源码编译兜底覆盖
   if [ "$need_compile" -eq 1 ]; then
     build_install_srt_from_source
     current_ver=$(check_srt_version "$(command -v srt-live-transmit)")
@@ -431,6 +427,18 @@ udp_port_listener_exists() {
   return 1
 }
 
+prompt_for_ports() {
+  echo
+  echo -e "${BLUE}================ 代理端口交互配置 =====================${RESET}"
+  read -r -p "请输入想要接管的本地 UDP 端口 [默认 $LOCAL_UDP_PORT]: " input_udp
+  [ -n "$input_udp" ] && LOCAL_UDP_PORT="$input_udp"
+
+  read -r -p "请输入对外暴露的公网 SRT 端口 [默认 $PROXY_SRT_PORT]: " input_srt
+  [ -n "$input_srt" ] && PROXY_SRT_PORT="$input_srt"
+  echo -e "${BLUE}=======================================================${RESET}"
+  echo
+}
+
 deploy_with_systemd() {
   write_env_file
   build_run_helper
@@ -519,15 +527,58 @@ cleanup_proxy() {
     local pid
     pid="$(cat "$PID_FILE" 2>/dev/null || true)"
     if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+      info "正在停止前台代理进程 PID=$pid ..."
       kill "$pid" >/dev/null 2>&1 || true
+      sleep 1
+      if kill -0 "$pid" 2>/dev/null; then
+         kill -9 "$pid" >/dev/null 2>&1 || true
+      fi
     fi
   fi
 
   rm -f "$ENV_FILE" "$RUN_HELPER" "$PID_FILE" "$STATE_FILE"
 
-  log "代理核心配置清理完成。"
-  warn "日志文件 $LOG_FILE 已保留，便于排障。"
-  warn "已安装的 SRT 依赖/二进制已被保留，以免破坏其他环境配置。"
+  echo
+  read -r -p "是否进行【深度清理】(连同日志、SRT 源码、包管理器产物彻底删除)? [y/N]: " deep_clean
+  case "$deep_clean" in
+    [yY][eE][sS]|[yY])
+      info "执行物理级深度扫除..."
+
+      if [ -f "${SRC_DIR}/srt-${SRT_VERSION}/build/Makefile" ]; then
+         cd "${SRC_DIR}/srt-${SRT_VERSION}/build" && make uninstall >/dev/null 2>&1 || true
+      fi
+
+      rm -f /usr/local/bin/srt-*
+      rm -f /usr/local/lib/libsrt*
+      rm -rf /usr/local/include/srt
+      rm -f /usr/local/lib/pkgconfig/srt.pc /usr/local/lib/pkgconfig/haisrt.pc
+      
+      ldconfig >/dev/null 2>&1 || true
+
+      rm -rf "${SRC_DIR}"/srt-[0-9]* "${SRC_DIR}"/srt-[0-9]*.tar.gz 2>/dev/null || true
+
+      local pm
+      pm="$(detect_pm)"
+      case "$pm" in
+        apt)
+          DEBIAN_FRONTEND=noninteractive apt-get purge -y srt-tools libsrt1.5-openssl >/dev/null 2>&1 || true
+          DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >/dev/null 2>&1 || true
+          ;;
+        dnf|yum) $pm remove -y srt srt-tools >/dev/null 2>&1 || true ;;
+        zypper) zypper rm -y srt srt-tools >/dev/null 2>&1 || true ;;
+        pacman) pacman -Rns --noconfirm srt >/dev/null 2>&1 || true ;;
+      esac
+
+      rm -rf "$WORKDIR"
+
+      log "深度清理完成：本脚本相关的所有 SRT 组件及残留库已被物理拔除。"
+      ;;
+    *)
+      log "基础清理完成。"
+      warn "代理服务配置已移除，日志文件 $LOG_FILE 与工作目录已保留，便于排障。"
+      warn "SRT 底层二进制及依赖库未被触碰，以免破坏宿主机其他业务环境。"
+      ;;
+  esac
 }
 
 show_status() {
@@ -535,9 +586,9 @@ show_status() {
   local rt_status="Disabled"
   
   local disp_srt_host="${PROXY_SRT_HOST:-0.0.0.0}"
-  local disp_srt_port="${PROXY_SRT_PORT:-10001}"
+  local disp_srt_port="${PROXY_SRT_PORT:-60001}"
   local disp_udp_host="${LOCAL_UDP_HOST:-127.0.0.1}"
-  local disp_udp_port="${LOCAL_UDP_PORT:-10000}"
+  local disp_udp_port="${LOCAL_UDP_PORT:-60000}"
   local disp_latency="${LATENCY_MS:-200}"
   local disp_buf="${BUFFER_BYTES:-N/A}"
 
@@ -628,7 +679,7 @@ show_menu() {
   clear || true
   cat <<'EOF_MENU'
 =====================================================
- Live Relay SRT 代理管控工具 (稳定版) 
+ Live Relay SRT 代理管控工具
 =====================================================
  1) 部署 / 启动 SRT 代理隧道
  2) 查看当前运行状态
@@ -646,14 +697,14 @@ usage() {
   bash $0 cleanup
 
 可选环境变量:
-  LOCAL_UDP_PORT=10000
-  PROXY_SRT_PORT=10001
+  LOCAL_UDP_PORT=60000
+  PROXY_SRT_PORT=60001
   LATENCY_MS=200
   BUFFER_BYTES=8388608
   ENABLE_RT_SCHED=auto (auto|1|0)
 
 示例:
-  LOCAL_UDP_PORT=10000 PROXY_SRT_PORT=10001 LATENCY_MS=200 bash $0 apply
+  LOCAL_UDP_PORT=60000 PROXY_SRT_PORT=60001 LATENCY_MS=200 bash $0 apply
 EOF
 }
 
@@ -691,6 +742,7 @@ main() {
     read -r -p "请选择 [0-3]：" choice
     case "$choice" in
       1)
+        prompt_for_ports
         apply_proxy
         break
         ;;
