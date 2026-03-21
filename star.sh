@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.3.5-srt-proxy-stable"
+VERSION="1.3.6-srt-proxy-stable"
 WORKDIR="/opt/live-relay-srt-smart"
 SRC_DIR="/usr/local/src"
 ENV_FILE="/etc/live-relay-srt-smart.env"
@@ -178,7 +178,10 @@ ensure_build_deps() {
   pm="$(detect_pm)"
 
   case "$pm" in
-    apt) install_packages "$pm" ca-certificates wget curl tar pkg-config cmake make gcc g++ libssl-dev tcl ;;
+    apt) 
+      # 核心加固：强制包含 build-essential 和 libc6-dev，免疫 autoremove 造成的编译链断裂
+      install_packages "$pm" ca-certificates wget curl tar pkg-config cmake make gcc g++ libssl-dev tcl build-essential libc6-dev 
+      ;;
     dnf) install_packages "$pm" ca-certificates wget curl tar pkgconf-pkg-config cmake make gcc gcc-c++ openssl-devel tcl ;;
     yum) install_packages "$pm" epel-release || true; install_packages "$pm" ca-certificates wget curl tar pkgconfig cmake make gcc gcc-c++ openssl-devel tcl ;;
     zypper) install_packages "$pm" ca-certificates wget curl tar pkg-config cmake make gcc gcc-c++ libopenssl-devel tcl ;;
@@ -269,11 +272,13 @@ version_lt() {
 ensure_srt_installed() {
   local current_ver
   local need_compile=0
+  local lowest
 
   if command -v srt-live-transmit >/dev/null 2>&1; then
     current_ver=$(check_srt_version "$(command -v srt-live-transmit)")
     if [ "$current_ver" != "0.0.0" ]; then
-      if version_lt "$current_ver" "$SRT_VERSION"; then
+      lowest="$(printf '%s\n' "$current_ver" "$SRT_VERSION" | sort -V | head -n1)"
+      if [ "$lowest" = "$current_ver" ] && [ "$current_ver" != "$SRT_VERSION" ]; then
         warn "检测到当前已安装的 SRT 版本 ($current_ver) 低于目标版本 ($SRT_VERSION)。"
         info "准备切入源码编译模式进行强覆盖升级..."
         need_compile=1
@@ -288,7 +293,8 @@ ensure_srt_installed() {
     if try_install_srt_from_repo; then
       current_ver=$(check_srt_version "$(command -v srt-live-transmit)")
       if [ "$current_ver" != "0.0.0" ]; then
-        if version_lt "$current_ver" "$SRT_VERSION"; then
+        lowest="$(printf '%s\n' "$current_ver" "$SRT_VERSION" | sort -V | head -n1)"
+        if [ "$lowest" = "$current_ver" ] && [ "$current_ver" != "$SRT_VERSION" ]; then
           warn "包管理器提供的版本太老 ($current_ver)，拒绝使用此残次版本。"
           info "准备切入源码编译模式进行兜底升级..."
           need_compile=1
@@ -561,8 +567,8 @@ cleanup_proxy() {
       pm="$(detect_pm)"
       case "$pm" in
         apt)
-          DEBIAN_FRONTEND=noninteractive apt-get purge -y srt-tools libsrt1.5-openssl >/dev/null 2>&1 || true
-          DEBIAN_FRONTEND=noninteractive apt-get autoremove -y >/dev/null 2>&1 || true
+          # 彻底废除 autoremove 防治误杀编译链，仅精准 purge SRT
+          DEBIAN_FRONTEND=noninteractive apt-get purge -y srt-tools libsrt1.5-openssl libsrt1.4-openssl >/dev/null 2>&1 || true
           ;;
         dnf|yum) $pm remove -y srt srt-tools >/dev/null 2>&1 || true ;;
         zypper) zypper rm -y srt srt-tools >/dev/null 2>&1 || true ;;
