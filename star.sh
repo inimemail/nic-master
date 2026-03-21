@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.2.0-srt-proxy-ultimate"
+VERSION="1.3.1-srt-proxy-stable"
 WORKDIR="/opt/live-relay-srt-smart"
 SRC_DIR="/usr/local/src"
 ENV_FILE="/etc/live-relay-srt-smart.env"
@@ -17,7 +17,9 @@ LOCAL_UDP_HOST="${LOCAL_UDP_HOST:-127.0.0.1}"
 LOCAL_UDP_PORT="${LOCAL_UDP_PORT:-10000}"
 PROXY_SRT_HOST="${PROXY_SRT_HOST:-0.0.0.0}"
 PROXY_SRT_PORT="${PROXY_SRT_PORT:-10001}"
-LATENCY_MS="${LATENCY_MS:-auto}"
+LATENCY_MS="${LATENCY_MS:-200}"
+BUFFER_BYTES="${BUFFER_BYTES:-8388608}"
+ENABLE_RT_SCHED="${ENABLE_RT_SCHED:-auto}"
 
 GREEN='\033[32m'
 YELLOW='\033[33m'
@@ -106,17 +108,11 @@ smart_build_jobs() {
   mem="$(mem_total_gb)"
   cpu="$(cpu_count)"
 
-  # 智能编译并发控制，防 VPS 爆内存 (OOM)
-  if [ "$mem" -le 1 ]; then
-    echo 1
-  elif [ "$mem" -le 2 ] && [ "$cpu" -gt 2 ]; then
-    echo 2
-  elif [ "$cpu" -le 1 ]; then
-    echo 1
-  elif [ "$cpu" -le 2 ]; then
-    echo "$cpu"
-  else
-    echo "$cpu"
+  if [ "$mem" -le 1 ]; then echo 1
+  elif [ "$mem" -le 2 ] && [ "$cpu" -gt 2 ]; then echo 2
+  elif [ "$cpu" -le 1 ]; then echo 1
+  elif [ "$cpu" -le 2 ]; then echo "$cpu"
+  else echo "$cpu"
   fi
 }
 
@@ -126,9 +122,8 @@ normalize_config() {
     LOCAL_UDP_HOST="127.0.0.1"
   fi
 
-  # 剥离原版基于内存猜测网络延迟的谬误逻辑，回归物理本质
   if [ "$LATENCY_MS" = "auto" ] || [ -z "$LATENCY_MS" ]; then
-    warn "未指定公网物理延迟 (LATENCY_MS)，默认锁定为安全基线 200 ms。"
+    log "LATENCY_MS 未指定或为 auto，采用安全固定值 200 ms。"
     LATENCY_MS=200
   fi
 }
@@ -147,6 +142,7 @@ validate_config() {
   validate_number "LOCAL_UDP_PORT" "$LOCAL_UDP_PORT"
   validate_number "PROXY_SRT_PORT" "$PROXY_SRT_PORT"
   validate_number "LATENCY_MS" "$LATENCY_MS"
+  validate_number "BUFFER_BYTES" "$BUFFER_BYTES"
 
   if [ "$LOCAL_UDP_PORT" -lt 1 ] || [ "$LOCAL_UDP_PORT" -gt 65535 ]; then
     err "LOCAL_UDP_PORT 超出范围：$LOCAL_UDP_PORT"
@@ -157,14 +153,8 @@ validate_config() {
     exit 1
   fi
 
-  if [ "$LATENCY_MS" -lt 20 ]; then
-    warn "LATENCY_MS=$LATENCY_MS 较低，跨国/丢包环境下可能导致 ARQ 重传失效。"
-  elif [ "$LATENCY_MS" -gt 800 ]; then
-    warn "LATENCY_MS=$LATENCY_MS 较高，虽极抗丢包但时延会明显增加。"
-  fi
-
   if [ "$LOCAL_UDP_HOST" = "0.0.0.0" ]; then
-    warn "LOCAL_UDP_HOST=0.0.0.0 通常不适合作为 UDP 发送目标，建议改为 127.0.0.1 或内网互联地址。"
+    warn "LOCAL_UDP_HOST=0.0.0.0 通常不适合作为 UDP 发送目标，建议改为 127.0.0.1 或内部互联地址。"
   fi
 }
 
@@ -172,9 +162,7 @@ ensure_runtime_tools() {
   local pm
   pm="$(detect_pm)"
 
-  if command -v ss >/dev/null 2>&1; then
-    return 0
-  fi
+  if command -v ss >/dev/null 2>&1; then return 0; fi
 
   case "$pm" in
     apt) install_packages "$pm" iproute2 ;;
@@ -190,27 +178,40 @@ ensure_build_deps() {
   pm="$(detect_pm)"
 
   case "$pm" in
+    apt) install_packages "$pm" ca-certificates wget curl tar pkg-config cmake make gcc g++ libssl-dev tcl ;;
+    dnf) install_packages "$pm" ca-certificates wget curl tar pkgconf-pkg-config cmake make gcc gcc-c++ openssl-devel tcl ;;
+    yum) install_packages "$pm" epel-release || true; install_packages "$pm" ca-certificates wget curl tar pkgconfig cmake make gcc gcc-c++ openssl-devel tcl ;;
+    zypper) install_packages "$pm" ca-certificates wget curl tar pkg-config cmake make gcc gcc-c++ libopenssl-devel tcl ;;
+    pacman) install_packages "$pm" ca-certificates wget curl tar pkgconf cmake make gcc openssl tcl ;;
+    *) err "未找到受支持的包管理器，请手动安装 SRT 编译依赖。"; exit 1 ;;
+  esac
+}
+
+try_install_srt_from_repo() {
+  local pm
+  pm="$(detect_pm)"
+  info "尝试通过包管理器安装 SRT ..."
+
+  case "$pm" in
     apt)
-      install_packages "$pm" ca-certificates wget curl tar pkg-config cmake make gcc g++ libssl-dev tcl
+      install_packages "$pm" srt-tools libsrt1.5-openssl >/dev/null 2>&1 || \
+      install_packages "$pm" srt-tools >/dev/null 2>&1 || true
       ;;
-    dnf)
-      install_packages "$pm" ca-certificates wget curl tar pkgconf-pkg-config cmake make gcc gcc-c++ openssl-devel tcl
-      ;;
-    yum)
-      install_packages "$pm" epel-release || true
-      install_packages "$pm" ca-certificates wget curl tar pkgconfig cmake make gcc gcc-c++ openssl-devel tcl
+    dnf|yum)
+      install_packages "$pm" srt srt-tools >/dev/null 2>&1 || \
+      install_packages "$pm" srt >/dev/null 2>&1 || true
       ;;
     zypper)
-      install_packages "$pm" ca-certificates wget curl tar pkg-config cmake make gcc gcc-c++ libopenssl-devel tcl
+      install_packages "$pm" srt-tools srt >/dev/null 2>&1 || \
+      install_packages "$pm" srt >/dev/null 2>&1 || true
       ;;
     pacman)
-      install_packages "$pm" ca-certificates wget curl tar pkgconf cmake make gcc openssl tcl
+      install_packages "$pm" srt >/dev/null 2>&1 || true
       ;;
-    *)
-      err "未找到受支持的包管理器，请手动安装 SRT 依赖。"
-      exit 1
-      ;;
+    *) true ;;
   esac
+
+  command -v srt-live-transmit >/dev/null 2>&1
 }
 
 download_srt_source() {
@@ -240,15 +241,9 @@ build_install_srt_from_source() {
   ensure_build_deps
   download_srt_source
 
-  info "强制编译安装 SRT v${SRT_VERSION}，规避包管理器旧版本 Bug..."
-  info "当前编译并发: -j${jobs}"
-
+  info "开始编译安装 SRT v${SRT_VERSION} (并发数: -j${jobs}) ..."
   cd "${SRC_DIR}/srt-${SRT_VERSION}"
-  cmake -S . -B build \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DENABLE_APPS=ON \
-    -DENABLE_SHARED=ON
-
+  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_APPS=ON -DENABLE_SHARED=ON
   cmake --build build -j"${jobs}"
   cmake --install build
   ldconfig
@@ -259,12 +254,33 @@ build_install_srt_from_source() {
   fi
 }
 
+check_srt_version() {
+  local bin="$1"
+  local ver
+  ver=$("$bin" -version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || echo "0.0.0")
+  echo "$ver"
+}
+
 ensure_srt_installed() {
+  local current_ver lowest
   if command -v srt-live-transmit >/dev/null 2>&1; then
-    # 简单的版本号判断，如果低于 1.5，建议重编，但这里为了鲁棒性只做基础检测
-    log "检测到 srt-live-transmit 已安装，跳过源码编译。"
+    current_ver=$(check_srt_version "$(command -v srt-live-transmit)")
+    log "检测到已安装 srt-live-transmit (版本: ${current_ver})。"
+    
+    lowest="$(printf '%s\n' "$current_ver" "$SRT_VERSION" | sort -V | head -n1)"
+    if [ "$current_ver" != "0.0.0" ] && [ "$lowest" = "$current_ver" ] && [ "$current_ver" != "$SRT_VERSION" ]; then
+      warn "当前 SRT 版本 ($current_ver) 低于目标版本 ($SRT_VERSION)，若遇性能瓶颈，建议清理后重装以触发源码编译。"
+    fi
     return 0
   fi
+
+  if try_install_srt_from_repo; then
+    current_ver=$(check_srt_version "$(command -v srt-live-transmit)")
+    log "已通过包管理器成功安装 SRT (版本: ${current_ver})。"
+    return 0
+  fi
+
+  warn "包管理器安装未成功或源不存在，切换至源码编译兜底..."
   build_install_srt_from_source
 }
 
@@ -276,12 +292,20 @@ find_srt_bin() {
       [ -x "$p" ] && bin="$p" && break
     done
   fi
-
   [ -n "$bin" ] || { err "未找到 srt-live-transmit。"; exit 1; }
   echo "$bin"
 }
 
 write_env_file() {
+  local use_rt=0
+  if [ "$ENABLE_RT_SCHED" = "auto" ]; then
+    if [ "$(detect_env_type)" = "baremetal" ]; then
+      use_rt=1
+    fi
+  elif [ "$ENABLE_RT_SCHED" = "1" ] || [ "$ENABLE_RT_SCHED" = "true" ]; then
+    use_rt=1
+  fi
+
   cat > "$ENV_FILE" <<EOF
 SRT_BIN=$(find_srt_bin)
 LOCAL_UDP_HOST=${LOCAL_UDP_HOST}
@@ -289,6 +313,8 @@ LOCAL_UDP_PORT=${LOCAL_UDP_PORT}
 PROXY_SRT_HOST=${PROXY_SRT_HOST}
 PROXY_SRT_PORT=${PROXY_SRT_PORT}
 LATENCY_MS=${LATENCY_MS}
+BUFFER_BYTES=${BUFFER_BYTES}
+USE_RT_SCHED=${use_rt}
 EOF
 }
 
@@ -302,37 +328,45 @@ ENV_FILE="/etc/live-relay-srt-smart.env"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
-# 核心：即使退化为无 systemd 模式，依然强行注入 8MB 内核接收/发送缓冲窗
 exec "$SRT_BIN" \
-  "srt://${PROXY_SRT_HOST}:${PROXY_SRT_PORT}?mode=listener&latency=${LATENCY_MS}&rcvbuf=8388608&sndbuf=8388608" \
-  "udp://${LOCAL_UDP_HOST}:${LOCAL_UDP_PORT}?sndbuf=8388608&rcvbuf=8388608"
+  "srt://${PROXY_SRT_HOST}:${PROXY_SRT_PORT}?mode=listener&latency=${LATENCY_MS}&rcvbuf=${BUFFER_BYTES}&sndbuf=${BUFFER_BYTES}" \
+  "udp://${LOCAL_UDP_HOST}:${LOCAL_UDP_PORT}?sndbuf=${BUFFER_BYTES}&rcvbuf=${BUFFER_BYTES}"
 EOF
   chmod +x "$RUN_HELPER"
 }
 
 build_service() {
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=Live Relay Ultimate SRT to UDP Proxy
+Description=Live Relay SRT to UDP Proxy
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 EnvironmentFile=${ENV_FILE}
-ExecStart=/bin/bash -c 'exec "\$SRT_BIN" "srt://\${PROXY_SRT_HOST}:\${PROXY_SRT_PORT}?mode=listener&latency=\${LATENCY_MS}&rcvbuf=8388608&sndbuf=8388608" "udp://\${LOCAL_UDP_HOST}:\${LOCAL_UDP_PORT}?sndbuf=8388608&rcvbuf=8388608"'
-
+ExecStart=${RUN_HELPER}
 Restart=always
 RestartSec=3
 StartLimitIntervalSec=0
 LimitNOFILE=1048576
+EOF
 
-# 核心：实时调度 (Real-Time Scheduling) 防御 VPS 层面的 Steal Time 软抖动
+  if [ "${USE_RT_SCHED:-0}" = "1" ]; then
+    cat >> "$SERVICE_FILE" <<EOF
+
+# RT 实时调度机制 (仅在物理机或手动开启时注入，防御 CAP_SYS_NICE 权限拦截)
 CPUSchedulingPolicy=rr
 CPUSchedulingPriority=89
 IOSchedulingClass=realtime
 IOSchedulingPriority=0
+EOF
+  fi
 
+  cat >> "$SERVICE_FILE" <<EOF
 NoNewPrivileges=true
 
 [Install]
@@ -342,7 +376,7 @@ EOF
 
 persist_state() {
   cat > "$STATE_FILE" <<EOF
-PROFILE=srt-proxy-ultimate
+PROFILE=srt-proxy-stable
 ENV_TYPE=$(detect_env_type)
 SYSTEMD=$(has_systemd && echo yes || echo no)
 UPDATED_AT=$(date +%F_%T)
@@ -372,13 +406,13 @@ deploy_with_systemd() {
   build_run_helper
   build_service
 
-  info "正在安装并启动 systemd 实时抢占服务..."
+  info "正在重载并启动 systemd 服务..."
   systemctl daemon-reload
-  systemctl enable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
   systemctl restart "$SERVICE_NAME"
 
   if systemctl is-active --quiet "$SERVICE_NAME"; then
-    log "SRT 代理服务已启动 (包含 RT 实时抢占及 8MB 缓冲优化)。"
+    log "SRT 代理服务已成功拉起。"
   else
     err "systemd 服务启动失败。"
     echo "排查命令："
@@ -402,7 +436,7 @@ deploy_without_systemd() {
     fi
   fi
 
-  info "当前环境无 systemd，改用 nohup 后台运行模式..."
+  info "未检测到 systemd，触发 nohup 进程托底模式..."
   nohup "$RUN_HELPER" >>"$LOG_FILE" 2>&1 &
   echo $! > "$PID_FILE"
   sleep 1
@@ -410,7 +444,7 @@ deploy_without_systemd() {
   if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     log "SRT 代理已在后台启动 (降级为普通进程优先级)。"
   else
-    err "后台运行模式启动失败，请检查日志：$LOG_FILE"
+    err "后台启动失败，请检查日志：$LOG_FILE"
     exit 1
   fi
 }
@@ -427,7 +461,7 @@ apply_proxy() {
   if udp_port_listener_exists "$LOCAL_UDP_HOST" "$LOCAL_UDP_PORT"; then
     log "检测到本地 UDP 端口 ${LOCAL_UDP_HOST}:${LOCAL_UDP_PORT} 已有监听程序。"
   else
-    warn "未明显检测到本地 UDP 监听 ${LOCAL_UDP_HOST}:${LOCAL_UDP_PORT}，代理仍会部署，请确认下游业务已启动。"
+    warn "未明显检测到本地 UDP 监听 ${LOCAL_UDP_HOST}:${LOCAL_UDP_PORT}，代理仍会部署，请确认下游业务已拉起。"
   fi
 
   ensure_srt_installed
@@ -443,7 +477,7 @@ apply_proxy() {
 }
 
 cleanup_proxy() {
-  info "正在清理 SRT 终极代理配置..."
+  info "正在清理 SRT 代理相关配置..."
 
   if has_systemd; then
     systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
@@ -461,21 +495,49 @@ cleanup_proxy() {
 
   rm -f "$ENV_FILE" "$RUN_HELPER" "$PID_FILE" "$STATE_FILE"
 
-  log "代理配置已清理完成。"
-  warn "已安装的 SRT 源码编译组件不会自动卸载，请保留以防重复编译耗时。"
+  log "代理核心配置清理完成。"
+  warn "日志文件 $LOG_FILE 已保留，便于排障。"
+  warn "已安装的 SRT 依赖/二进制已被保留，以免破坏其他环境配置。"
 }
 
 show_status() {
-  local env_type systemd_state mem cpu srt_bin run_mode enabled active pid=""
+  local env_type systemd_state mem cpu srt_bin run_mode enabled active pid="" current_ver="unknown"
+  local rt_status="Disabled"
+  
+  # 用于状态显示的变量，优先读配置文件，若不存在则读取当前环境作为预演
+  local disp_srt_host="${PROXY_SRT_HOST:-0.0.0.0}"
+  local disp_srt_port="${PROXY_SRT_PORT:-10001}"
+  local disp_udp_host="${LOCAL_UDP_HOST:-127.0.0.1}"
+  local disp_udp_port="${LOCAL_UDP_PORT:-10000}"
+  local disp_latency="${LATENCY_MS:-200}"
+  local disp_buf="${BUFFER_BYTES:-N/A}"
 
   env_type="$(detect_env_type)"
   systemd_state="$(has_systemd && echo yes || echo no)"
   mem="$(mem_total_gb)"
   cpu="$(cpu_count)"
   srt_bin="$(find_srt_bin 2>/dev/null || echo not-found)"
+  
+  if [ "$srt_bin" != "not-found" ]; then
+    current_ver="$(check_srt_version "$srt_bin")"
+  fi
+
   run_mode="none"
   enabled="disabled"
   active="inactive"
+
+  # 强一致性逻辑：运行状态只从写死的 ENV_FILE 中读取
+  if [ -f "$ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    disp_srt_host="$PROXY_SRT_HOST"
+    disp_srt_port="$PROXY_SRT_PORT"
+    disp_udp_host="$LOCAL_UDP_HOST"
+    disp_udp_port="$LOCAL_UDP_PORT"
+    disp_latency="$LATENCY_MS"
+    disp_buf="$BUFFER_BYTES"
+    if [ "${USE_RT_SCHED:-0}" = "1" ]; then rt_status="Enabled (Systemd)"; fi
+  fi
 
   if has_systemd; then
     if systemctl cat "$SERVICE_NAME" >/dev/null 2>&1; then
@@ -495,24 +557,21 @@ show_status() {
 
   echo
   echo "================ 状态信息 ================"
-  printf '%-22s %s\n' "当前配置:" "srt-proxy-ultimate"
+  printf '%-22s %s\n' "当前配置:" "srt-proxy-stable"
   printf '%-22s %s\n' "脚本版本:" "$VERSION"
   printf '%-22s %s\n' "环境类型:" "$env_type"
   printf '%-22s %s\n' "systemd 可用:" "$systemd_state"
   printf '%-22s %s\n' "CPU 核数:" "$cpu"
   printf '%-22s %s\n' "内存大小:" "${mem} GiB"
-  printf '%-22s %s\n' "SRT 目标版本:" "$SRT_VERSION"
-  printf '%-22s %s\n' "SRT 可执行文件:" "$srt_bin"
+  printf '%-22s %s\n' "SRT 当前版本:" "$current_ver"
   printf '%-22s %s\n' "代理运行方式:" "$run_mode"
   printf '%-22s %s\n' "是否启用:" "$enabled"
   printf '%-22s %s\n' "运行状态:" "$active"
-  printf '%-22s %s\n' "底层缓冲透传:" "8388608 Bytes (8MB) - Enabled"
-  printf '%-22s %s\n' "SRT 监听地址:" "${PROXY_SRT_HOST}:${PROXY_SRT_PORT}"
-  printf '%-22s %s\n' "本地 UDP 目标:" "${LOCAL_UDP_HOST}:${LOCAL_UDP_PORT}"
-  printf '%-22s %s\n' "重传延迟(LATENCY):" "${LATENCY_MS} ms"
-  printf '%-22s %s\n' "环境文件:" "$ENV_FILE"
-  printf '%-22s %s\n' "运行脚本:" "$RUN_HELPER"
-  printf '%-22s %s\n' "日志文件:" "$LOG_FILE"
+  printf '%-22s %s\n' "底层缓冲请求:" "${disp_buf} Bytes"
+  printf '%-22s %s\n' "实时调度策略(RT):" "$rt_status"
+  printf '%-22s %s\n' "SRT 监听地址:" "${disp_srt_host}:${disp_srt_port}"
+  printf '%-22s %s\n' "本地 UDP 目标:" "${disp_udp_host}:${disp_udp_port}"
+  printf '%-22s %s\n' "重传延迟(LATENCY):" "${disp_latency} ms"
 
   if [ -n "${pid:-}" ]; then
     printf '%-22s %s\n' "nohup PID:" "$pid"
@@ -520,7 +579,7 @@ show_status() {
 
   if command -v ss >/dev/null 2>&1; then
     echo "端口监听:"
-    ss -ltnup 2>/dev/null | grep -E "(:${PROXY_SRT_PORT}|:${LOCAL_UDP_PORT})" || echo "  未检测到相关监听"
+    ss -ltnup 2>/dev/null | grep -E "(:${disp_srt_port}|:${disp_udp_port})" || echo "  未检测到相关监听"
   fi
 
   if has_systemd && systemctl cat "$SERVICE_NAME" >/dev/null 2>&1; then
@@ -541,11 +600,11 @@ show_menu() {
   clear || true
   cat <<'EOF_MENU'
 =====================================================
- Live Relay 智能自适 SRT 代理工具
+ Live Relay SRT 代理管控工具
 =====================================================
- 1) 智能部署 / 启动 SRT -> UDP 代理
- 2) 查看当前状态
- 3) 清理代理配置
+ 1) 部署 / 启动 SRT 代理隧道
+ 2) 查看当前运行状态
+ 3) 清理并移除代理
  0) 退出
 =====================================================
 EOF_MENU
@@ -559,12 +618,11 @@ usage() {
   bash $0 cleanup
 
 可选环境变量:
-  SRT_VERSION=1.5.3
-  LOCAL_UDP_HOST=127.0.0.1
   LOCAL_UDP_PORT=10000
-  PROXY_SRT_HOST=0.0.0.0
   PROXY_SRT_PORT=10001
   LATENCY_MS=200
+  BUFFER_BYTES=8388608
+  ENABLE_RT_SCHED=auto (auto|1|0)
 
 示例:
   LOCAL_UDP_PORT=10000 PROXY_SRT_PORT=10001 LATENCY_MS=200 bash $0 apply
