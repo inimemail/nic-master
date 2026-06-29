@@ -1629,6 +1629,11 @@ cleanup_live_relay() {
     warn "检测到容器环境，已完成基础清理。"
     return 0
   fi
+  
+  if grep -qaE 'lxc|container' /proc/1/environ 2>/dev/null || grep -qaE 'lxc|container' /proc/1/cgroup 2>/dev/null; then
+    echo -e "${YELLOW}⚠️ 检测到当前环境为 LXC 容器，已完成基础清理，但跳过 HIA BBR 优化。${RESET}"
+    return
+  fi
 
   echo -e "${GREEN}[信息] 正在注入 HIA 极限基线参数...${RESET}"
 
