@@ -838,19 +838,40 @@ show_status() {
 }
 
 cleanup_live_relay() {
-  echo -e "${BLUE}[处理中] 正在清理历史调优配置文件...${RESET}"
+  info "正在清理 VPS 调优配置文件..."
+  
+  # 1. 停止并删除网卡调优自启服务
   remove_mode2_service
-  rm -f "$LIMITS_FILE" "$SYSTEMD_LIMIT_FILE" "$SYSCTL_FILE" "$STATE_FILE"
+  
+  # 2. 彻底删除脚本生成的所有独立内核文件、日志、服务和限制配置文件
+  rm -f "$LIMITS_FILE" \
+        "$SYSTEMD_LIMIT_FILE" \
+        "$SYSCTL_FILE" \
+        "$STATE_FILE" \
+        "$SYSCTL_LOG" \
+        "$NIC_ENV_FILE" \
+        "$NIC_HELPER" \
+        "/etc/systemd/system/live-relay-nic-tuning.service"
+        
+  # 删除工作目录
+  rm -rf "$WORKDIR"
+
+  # 3. 重新加载 systemd 守护进程
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
+
+  if is_container; then
+    warn "检测到容器环境，已完成基础清理。"
+    return 0
+  fi
+  
   if grep -qaE 'lxc|container' /proc/1/environ 2>/dev/null || grep -qaE 'lxc|container' /proc/1/cgroup 2>/dev/null; then
     echo -e "${YELLOW}⚠️ 检测到当前环境为 LXC 容器，已完成基础清理，但跳过 HIA BBR 优化。${RESET}"
     return
   fi
 
   echo -e "${GREEN}[信息] 正在注入 HIA 极限基线参数...${RESET}"
-  cp -n /etc/sysctl.conf /etc/sysctl.conf.bak || true
 
   cat > /etc/sysctl.conf <<EOF
 # ===== HIA BBR + TCP 优化参数 =====
