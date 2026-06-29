@@ -1520,9 +1520,23 @@ show_status() {
 
 cleanup_smart() {
   info "正在清理 smart-auto 配置..."
+  # 1. 停止并删除网卡调优自启服务
   remove_service
-  rm -f "$LIMITS_FILE" "$SYSTEMD_LIMIT_FILE" "$SYSCTL_FILE" "$STATE_FILE"
+  
+  # 2. 彻底删除脚本生成的所有独立内核文件、日志、服务和限制配置文件
+  rm -f "$LIMITS_FILE" \
+        "$SYSTEMD_LIMIT_FILE" \
+        "$SYSCTL_FILE" \
+        "$STATE_FILE" \
+        "$SYSCTL_LOG" \
+        "$NIC_ENV_FILE" \
+        "$NIC_HELPER" \
+        "/etc/systemd/system/live-relay-smart-auto.service"
+        
+  # 删除工作目录
+  rm -rf "$WORKDIR"
 
+  # 3. 重新加载 systemd 守护进程
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
