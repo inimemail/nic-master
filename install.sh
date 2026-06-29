@@ -1602,9 +1602,25 @@ show_status() {
 }
 
 cleanup_live_relay() {
-  info "正在清理历史调优配置文件..."
+  info "正在清理 VPS 调优配置文件..."
+  
+  # 1. 停止并删除网卡调优自启服务 (借鉴的彻底清理逻辑)
   remove_mode2_service
-  rm -f "$LIMITS_FILE" "$SYSTEMD_LIMIT_FILE" "$SYSCTL_FILE" "$STATE_FILE"
+  
+  # 2. 彻底删除脚本生成的所有独立内核文件、日志、服务和限制配置文件
+  rm -f "$LIMITS_FILE" \
+        "$SYSTEMD_LIMIT_FILE" \
+        "$SYSCTL_FILE" \
+        "$STATE_FILE" \
+        "$SYSCTL_LOG" \
+        "$NIC_ENV_FILE" \
+        "$NIC_HELPER" \
+        "/etc/systemd/system/live-relay-nic-tuning.service"
+        
+  # 删除工作目录
+  rm -rf "$WORKDIR"
+
+  # 3. 重新加载 systemd 守护进程
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
@@ -1615,7 +1631,6 @@ cleanup_live_relay() {
   fi
 
   echo -e "${GREEN}[信息] 正在注入 HIA 极限基线参数...${RESET}"
-  cp -n /etc/sysctl.conf /etc/sysctl.conf.bak || true
 
   cat > /etc/sysctl.conf <<'EOF_HIA'
 # ===== HIA BBR + TCP 优化参数 =====
