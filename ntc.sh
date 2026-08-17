@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="3.0.0-adaptive-relay"
+VERSION="4.0.0-autonomous-relay"
 WORKDIR="/opt/live-relay-tuner"
 NIC_ENV_FILE="/etc/live-relay-nic.env"
 NIC_HELPER="/usr/local/sbin/live-relay-nic-apply.sh"
@@ -22,6 +22,7 @@ HIA_SERVICE="/etc/systemd/system/hia-baseline.service"
 STATE_FILE="$WORKDIR/state.env"
 AUTO_STATE_FILE="$WORKDIR/auto-state.env"
 STABLE_STATE_FILE="$WORKDIR/stable-state.env"
+SYSCTL_STATE_FILE="$WORKDIR/sysctl-state.env"
 PAUSE_FILE="$WORKDIR/paused"
 SNAPSHOT_DIR="$WORKDIR/original"
 METRICS_LOG="$WORKDIR/metrics.log"
@@ -118,23 +119,29 @@ ensure_cmd() {
 }
 
 sysctl_proc_path() {
-  echo "/proc/sys/${1//./\/}"
+  echo "/proc/sys/${1//.//}"
 }
 
 append_if_supported() {
   local key="$1" value="$2" path
   path=$(sysctl_proc_path "$key")
-  if [ -e "$path" ]; then
+  if [ -e "$path" ] && [ -w "$path" ]; then
     printf '%s = %s\n' "$key" "$value" >> "$SYSCTL_FILE"
   fi
 }
 
 mem_total_kb() {
-  awk '/MemTotal:/ {print $2; exit}' /proc/meminfo
+  local value
+  value=$(awk '/MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)
+  case "$value" in ''|*[!0-9]*) value=1048576 ;; esac
+  echo "$value"
 }
 
 mem_total_gb() {
-  awk '/MemTotal:/ {printf "%d\n", int(($2 + 1048575) / 1048576)}' /proc/meminfo
+  local value
+  value=$(awk '/MemTotal:/ {printf "%d\n", int(($2 + 1048575) / 1048576); exit}' /proc/meminfo 2>/dev/null || true)
+  case "$value" in ''|*[!0-9]*) value=1 ;; esac
+  echo "$value"
 }
 
 online_cpu_count() {
@@ -152,6 +159,63 @@ physical_core_count() {
     return 0
   fi
   echo 0
+}
+
+numa_node_count() {
+  local count
+  count=$(find /sys/devices/system/node -maxdepth 1 -type d -name 'node[0-9]*' 2>/dev/null | awk 'END {print NR + 0}')
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  [ "$count" -gt 0 ] || count=1
+  echo "$count"
+}
+
+nic_driver_name() {
+  local nic="$1"
+  ethtool -i "$nic" 2>/dev/null | awk -F': ' '/driver:/ {print $2; exit}'
+}
+
+nic_speed_mbps() {
+  local nic="$1"
+  ethtool "$nic" 2>/dev/null | awk -F': ' '/Speed:/ {
+    gsub(/Mb\/s/, "", $2)
+    if ($2 ~ /^[0-9]+$/) print $2
+    exit
+  }'
+}
+
+nic_rx_queue_count() {
+  local nic="$1" count
+  count=$(find "/sys/class/net/$nic/queues" -maxdepth 1 -type d -name 'rx-*' 2>/dev/null | awk 'END {print NR + 0}')
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  [ "$count" -gt 0 ] || count=1
+  echo "$count"
+}
+
+collect_nic_irqs() {
+  local nic="$1" path device_tag=""
+  if [ -e "/sys/class/net/$nic/device" ]; then
+    device_tag=$(basename "$(readlink -f "/sys/class/net/$nic/device" 2>/dev/null || true)")
+  fi
+  for path in /sys/class/net/"$nic"/device/msi_irqs/*; do
+    [ -e "$path" ] && basename "$path"
+  done
+  awk -v dev="$nic" -v tag="$device_tag" '
+    $0 ~ dev || (tag != "" && $0 ~ tag) {gsub(":", "", $1); print $1}
+  ' /proc/interrupts 2>/dev/null
+}
+
+calc_socket_buffer_max() {
+  local mem_gb
+  mem_gb=$(mem_total_gb)
+  if [ "$mem_gb" -ge 128 ]; then
+    echo 268435456
+  elif [ "$mem_gb" -ge 8 ]; then
+    echo 134217728
+  elif [ "$mem_gb" -ge 2 ]; then
+    echo 67108864
+  else
+    echo 33554432
+  fi
 }
 
 current_cc_algo() {
@@ -217,10 +281,20 @@ EOF_HEADER
 }
 
 calc_conntrack_buckets() {
-  local mem_kb buckets
+  local mem_kb buckets page_size word_bits word_bytes buckets_per_page
   mem_kb=$(mem_total_kb)
   buckets=$(( mem_kb / 16 ))
   [ "$buckets" -lt 1024 ] && buckets=1024
+  [ "$buckets" -gt 262144 ] && buckets=262144
+  page_size=$(getconf PAGE_SIZE 2>/dev/null || echo 4096)
+  word_bits=$(getconf LONG_BIT 2>/dev/null || echo 64)
+  case "$page_size" in ''|*[!0-9]*) page_size=4096 ;; esac
+  case "$word_bits" in ''|*[!0-9]*) word_bits=64 ;; esac
+  word_bytes=$(( word_bits / 8 ))
+  [ "$word_bytes" -gt 0 ] || word_bytes=8
+  buckets_per_page=$(( page_size / word_bytes ))
+  [ "$buckets_per_page" -gt 0 ] || buckets_per_page=512
+  buckets=$(( ((buckets + buckets_per_page - 1) / buckets_per_page) * buckets_per_page ))
   [ "$buckets" -gt 262144 ] && buckets=262144
   echo "$buckets"
 }
@@ -320,11 +394,17 @@ calc_netdev_backlog() {
   esac
 
   case "$cpus" in ''|*[!0-9]*) cpus=1 ;; esac
-  if [ "$cpus" -ge 32 ]; then
-    base=$(( base + (base / 8) ))
+  if [ "$cpus" -ge 64 ]; then
+    base=$(( base + (base / 2) )); cap=131072
+  elif [ "$cpus" -ge 32 ]; then
+    base=$(( base + (base / 4) )); cap=98304
+  elif [ "$cpus" -ge 8 ]; then
+    base=$(( base + (base / 8) )); cap=65536
+  elif [ "$cpus" -ge 4 ]; then
+    cap=49152
+  else
+    cap=32768
   fi
-
-  cap=65536
 
   [ "$base" -gt "$cap" ] && base="$cap"
   [ "$base" -lt 8192 ] && base=8192
@@ -355,8 +435,16 @@ calc_netdev_budget() {
   esac
 
   case "$cpus" in ''|*[!0-9]*) cpus=1 ;; esac
-  [ "$cpus" -ge 32 ] && base=$(( base + 100 ))
-  [ "$base" -gt 1400 ] && base=1400
+  if [ "$cpus" -ge 64 ]; then
+    base=$(( base + 400 ))
+  elif [ "$cpus" -ge 32 ]; then
+    base=$(( base + 250 ))
+  elif [ "$cpus" -ge 16 ]; then
+    base=$(( base + 100 ))
+  elif [ "$cpus" -le 2 ] && [ "$base" -gt 800 ]; then
+    base=800
+  fi
+  [ "$base" -gt 1800 ] && base=1800
   echo "$base"
 }
 
@@ -384,7 +472,14 @@ calc_netdev_budget_usecs() {
   esac
 
   case "$cpus" in ''|*[!0-9]*) cpus=1 ;; esac
-  [ "$cpus" -ge 32 ] && base=$(( base + 500 ))
+  if [ "$cpus" -ge 64 ]; then
+    base=$(( base + 1500 ))
+  elif [ "$cpus" -ge 32 ]; then
+    base=$(( base + 750 ))
+  elif [ "$cpus" -le 2 ] && [ "$base" -gt 4000 ]; then
+    base=4000
+  fi
+  [ "$base" -gt 8000 ] && base=8000
 
   echo "$base"
 }
@@ -485,7 +580,7 @@ append_stable_sysctls() {
 }
 
 append_hyper_sysctls() {
-  local speed cpus somax backlog budget budget_usecs filemax flow_table_len udp_mem mem_gb
+  local speed cpus somax backlog budget budget_usecs filemax flow_table_len udp_mem mem_gb socket_max
   speed=$(detect_primary_speed)
   cpus=$(online_cpu_count)
   somax=$(calc_somaxconn)
@@ -496,6 +591,7 @@ append_hyper_sysctls() {
   flow_table_len=$(calc_flow_limit_table_len)
   udp_mem=$(calc_udp_mem_pages)
   mem_gb=$(mem_total_gb)
+  socket_max=$(calc_socket_buffer_max)
 
   append_if_supported net.core.somaxconn "$somax"
   append_if_supported net.ipv4.tcp_max_syn_backlog "$somax"
@@ -509,14 +605,14 @@ append_hyper_sysctls() {
 
   append_if_supported fs.file-max "$filemax"
 
-  append_if_supported net.core.rmem_max 134217728
-  append_if_supported net.core.wmem_max 134217728
+  append_if_supported net.core.rmem_max "$socket_max"
+  append_if_supported net.core.wmem_max "$socket_max"
   append_if_supported net.core.rmem_default 262144
   append_if_supported net.core.wmem_default 262144
   append_if_supported net.core.optmem_max 262144
 
-  append_if_supported net.ipv4.tcp_rmem "4096 262144 134217728"
-  append_if_supported net.ipv4.tcp_wmem "4096 131072 134217728"
+  append_if_supported net.ipv4.tcp_rmem "4096 262144 $socket_max"
+  append_if_supported net.ipv4.tcp_wmem "4096 131072 $socket_max"
   append_if_supported net.ipv4.udp_mem "$udp_mem"
   append_if_supported net.ipv4.udp_rmem_min 262144
 
@@ -587,7 +683,8 @@ write_profile_2() {
 
 apply_sysctl_file() {
   : > "$SYSCTL_LOG"
-  local line key value expected actual failed=0 stack_failed=0
+  local line key value expected actual path
+  local applied=0 normalized=0 skipped=0 failed=0 stack_failed=0
   if ! sysctl --system >>"$SYSCTL_LOG" 2>&1; then
     stack_failed=1
   fi
@@ -599,26 +696,52 @@ apply_sysctl_file() {
     value="${line#*=}"
     key=$(printf '%s' "$key" | tr -d '[:space:]')
     value=$(printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    path=$(sysctl_proc_path "$key")
+    if [ ! -e "$path" ] || [ ! -w "$path" ]; then
+      printf 'SKIPPED %s reason=unsupported-or-read-only\n' "$key" >> "$SYSCTL_LOG"
+      skipped=$(( skipped + 1 ))
+      continue
+    fi
     if ! sysctl -w "$key=$value" >>"$SYSCTL_LOG" 2>&1; then
-      failed=1
+      printf 'FAILED %s requested=%s reason=write-error\n' "$key" "$value" >> "$SYSCTL_LOG"
+      failed=$(( failed + 1 ))
       continue
     fi
     expected=$(printf '%s\n' "$value" | awk '{$1=$1; print}')
     actual=$(sysctl -n "$key" 2>/dev/null | awk '{$1=$1; print}' || true)
-    if [ "$actual" != "$expected" ]; then
-      printf 'verify mismatch: %s expected=%s actual=%s\n' "$key" "$expected" "${actual:-unknown}" >> "$SYSCTL_LOG"
-      failed=1
+    if [ "$actual" = "$expected" ]; then
+      applied=$(( applied + 1 ))
+    elif [ "$key" = "net.netfilter.nf_conntrack_buckets" ] && \
+         [[ "$expected" =~ ^[0-9]+$ ]] && [[ "$actual" =~ ^[0-9]+$ ]] && [ "$actual" -gt 0 ]; then
+      printf 'NORMALIZED %s requested=%s actual=%s reason=kernel-hash-alignment\n' "$key" "$expected" "$actual" >> "$SYSCTL_LOG"
+      normalized=$(( normalized + 1 ))
+    else
+      printf 'FAILED %s requested=%s actual=%s reason=verify-mismatch\n' "$key" "$expected" "${actual:-unknown}" >> "$SYSCTL_LOG"
+      failed=$(( failed + 1 ))
     fi
   done < "$SYSCTL_FILE"
 
-  if [ "$failed" -eq 0 ]; then
-    log "sysctl 参数已最后应用并逐项校验成功。"
-  else
-    warn "部分 sysctl 参数应用失败，请检查 $SYSCTL_LOG"
-  fi
   if [ "$stack_failed" -ne 0 ]; then
-    warn "sysctl --system 返回了非零状态；本配置已单独重放，请检查 $SYSCTL_LOG"
+    printf 'SYSTEM_STACK status=nonzero scope=external-and-system-files\n' >> "$SYSCTL_LOG"
   fi
+  local state_tmp="$SYSCTL_STATE_FILE.tmp.$$"
+  {
+    printf 'SYSCTL_APPLIED=%q\n' "$applied"
+    printf 'SYSCTL_NORMALIZED=%q\n' "$normalized"
+    printf 'SYSCTL_SKIPPED=%q\n' "$skipped"
+    printf 'SYSCTL_FAILED=%q\n' "$failed"
+    printf 'SYSCTL_EXTERNAL_NONZERO=%q\n' "$stack_failed"
+    printf 'SYSCTL_UPDATED_AT=%q\n' "$(date +%F_%T)"
+  } > "$state_tmp"
+  mv -f "$state_tmp" "$SYSCTL_STATE_FILE"
+  if [ "$failed" -eq 0 ]; then
+    log "sysctl：应用 ${applied}，规范化 ${normalized}，跳过 ${skipped}，失败 0。"
+    [ "$normalized" -eq 0 ] || log "内核自动调整了 ${normalized} 个参数，属于正常行为。"
+    [ "$stack_failed" -eq 0 ] || log "系统配置栈存在外部非零项；Live Relay 参数已独立重放并校验。"
+    return 0
+  fi
+  err "sysctl：应用 ${applied}，规范化 ${normalized}，跳过 ${skipped}，失败 ${failed}；详情：$SYSCTL_LOG"
+  return 1
 }
 
 build_sysctl_persistence() {
@@ -638,8 +761,8 @@ while IFS= read -r line || [ -n "\$line" ]; do
   value="\${line#*=}"
   key="\$(printf '%s' "\$key" | tr -d '[:space:]')"
   value="\$(printf '%s' "\$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*\$//')"
-  path="/proc/sys/\${key//./\/}"
-  [ -e "\$path" ] || continue
+  path="/proc/sys/\${key//.//}"
+  [ -e "\$path" ] && [ -w "\$path" ] || continue
   sysctl -q -w "\$key=\$value" >/dev/null 2>&1 || failed=1
 done < "\$SYSCTL_FILE"
 exit "\$failed"
@@ -649,7 +772,7 @@ EOF_SYSCTL_HELPER
   cat > "$SYSCTL_SERVICE" <<EOF_SYSCTL_SERVICE
 [Unit]
 Description=Reapply Live Relay sysctl profile after system defaults
-After=systemd-sysctl.service local-fs.target
+After=systemd-sysctl.service procps.service local-fs.target
 Before=network-pre.target
 
 [Service]
@@ -705,6 +828,10 @@ source "$NIC_ENV_FILE"
 
 DEV="${DEV:-}"
 [ -n "$DEV" ] || { echo "DEV 为空"; exit 1; }
+TUNER_STATE_DIR="${TUNER_STATE_DIR:-/opt/live-relay-tuner}"
+FLOW_LIMIT_BEFORE="$TUNER_STATE_DIR/flow-limit.before"
+FLOW_LIMIT_OWNED="$TUNER_STATE_DIR/flow-limit.owned"
+mkdir -p "$TUNER_STATE_DIR"
 
 for cmd in ethtool ip tc awk find sort; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "未找到 $cmd"; exit 1; }
@@ -787,6 +914,82 @@ _get_nic_numa_node() {
   fi
 }
 
+_get_nic_local_cpulist() {
+  if [ -r "/sys/class/net/$DEV/device/local_cpulist" ]; then
+    cat "/sys/class/net/$DEV/device/local_cpulist"
+  else
+    echo ""
+  fi
+}
+
+_get_nic_irq_cpu_hint() {
+  local path irq affinity first_cpu device_tag=""
+  if [ -e "/sys/class/net/$DEV/device" ]; then
+    device_tag=$(basename "$(readlink -f "/sys/class/net/$DEV/device" 2>/dev/null || true)")
+  fi
+  while read -r irq; do
+    case "$irq" in ''|*[!0-9]*) continue ;; esac
+    affinity=$(cat "/proc/irq/$irq/effective_affinity_list" 2>/dev/null || cat "/proc/irq/$irq/smp_affinity_list" 2>/dev/null || true)
+    [ -n "$affinity" ] || continue
+    first_cpu=""
+    read -r first_cpu < <(_expand_cpulist "$affinity") || true
+    [ -n "$first_cpu" ] || continue
+    printf '%s\n' "$first_cpu"
+    return 0
+  done < <(
+    for path in /sys/class/net/"$DEV"/device/msi_irqs/*; do
+      [ -e "$path" ] && basename "$path"
+    done
+    awk -v dev="$DEV" -v tag="$device_tag" '
+      $0 ~ dev || (tag != "" && $0 ~ tag) {gsub(":", "", $1); print $1}
+    ' /proc/interrupts 2>/dev/null
+  )
+  return 1
+}
+
+_resolve_nic_numa_node() {
+  local node hint local_cpus
+  node=$(_get_nic_numa_node)
+  case "$node" in
+    ''|*[!0-9-]*) node=-1 ;;
+  esac
+  if [ "$node" -ge 0 ]; then
+    echo "$node"
+    return 0
+  fi
+
+  if command -v lscpu >/dev/null 2>&1; then
+    hint=$(_get_nic_irq_cpu_hint || true)
+    case "$hint" in
+      ''|*[!0-9]*) : ;;
+      *)
+        node=$(lscpu -p=CPU,NODE,ONLINE 2>/dev/null | awk -F, -v cpu="$hint" '
+          !/^#/ && $1 == cpu && ($3 == "Y" || $3 == "1") && $2 ~ /^[0-9]+$/ {print $2; exit}
+        ')
+        if [ -n "$node" ]; then echo "$node"; return 0; fi
+        ;;
+    esac
+
+    local_cpus=$(_get_nic_local_cpulist)
+    node=$(lscpu -p=CPU,NODE,ONLINE 2>/dev/null | awk -F, -v spec="$local_cpus" '
+      function cpu_in_list(cpu, value,    n, i, part, bounds) {
+        if (value == "") return 0
+        n=split(value, part, ",")
+        for (i=1; i<=n; i++) {
+          if (part[i] ~ /-/) {
+            split(part[i], bounds, "-")
+            if (cpu >= bounds[1] && cpu <= bounds[2]) return 1
+          } else if (cpu == part[i]) return 1
+        }
+        return 0
+      }
+      !/^#/ && ($3 == "Y" || $3 == "1") && $2 ~ /^[0-9]+$/ && (spec == "" || cpu_in_list($1, spec)) {print $2; exit}
+    ')
+    if [ -n "$node" ]; then echo "$node"; return 0; fi
+  fi
+  echo -1
+}
+
 _get_max_combined() {
   ethtool -l "$DEV" 2>/dev/null | awk '
     /Pre-set maximums:/ {sec=1; next}
@@ -816,19 +1019,42 @@ _get_current_rings() {
 }
 
 _get_topology_lists() {
-  local nic_node use_ht
-  nic_node=$(_get_nic_numa_node)
+  local nic_node local_cpus use_ht
+  nic_node=$(_resolve_nic_numa_node)
+  local_cpus=$(_get_nic_local_cpulist)
   use_ht="${USE_HT:-0}"
 
   if command -v lscpu >/dev/null 2>&1 && lscpu -p=CPU,CORE,SOCKET,NODE,ONLINE >/dev/null 2>&1; then
-    lscpu -p=CPU,CORE,SOCKET,NODE,ONLINE | awk -F, -v want_node="$nic_node" -v use_ht="$use_ht" '
+    lscpu -p=CPU,CORE,SOCKET,NODE,ONLINE | awk -F, -v want_node="$nic_node" -v local_cpus="$local_cpus" -v use_ht="$use_ht" '
+      function cpu_in_list(cpu, spec,    n, i, range, bounds) {
+        if (spec == "") return 1
+        n = split(spec, range, ",")
+        for (i = 1; i <= n; i++) {
+          if (range[i] ~ /-/) {
+            split(range[i], bounds, "-")
+            if (cpu >= bounds[1] && cpu <= bounds[2]) return 1
+          } else if (cpu == range[i]) {
+            return 1
+          }
+        }
+        return 0
+      }
       !/^#/ && ($5 == "Y" || $5 == "1") {
         cpu = $1 + 0
         core = $2
         socket = $3
         node = $4
         key = socket ":" core
-        is_local = (want_node < 0 || node == want_node) ? 1 : 0
+        if (want_node >= 0) {
+          is_local = (node == want_node) ? 1 : 0
+          if (is_local && local_cpus != "") is_local = cpu_in_list(cpu, local_cpus)
+        }
+        else if (local_cpus != "") is_local = cpu_in_list(cpu, local_cpus)
+        else if (node !~ /^[0-9]+$/) is_local = 1
+        else {
+          if (fallback_node == "") fallback_node = node
+          is_local = (node == fallback_node) ? 1 : 0
+        }
 
         if (!(key in first_cpu)) {
           first_cpu[key] = cpu
@@ -849,7 +1075,10 @@ _get_topology_lists() {
     return 0
   fi
 
-  _expand_cpulist "$(cat /sys/devices/system/cpu/online)" | awk '{print "LOCAL_PRIMARY " $1}'
+  local fallback_cpus
+  fallback_cpus="$local_cpus"
+  [ -n "$fallback_cpus" ] || fallback_cpus="$(cat /sys/devices/system/cpu/online)"
+  _expand_cpulist "$fallback_cpus" | awk '{print "LOCAL_PRIMARY " $1}'
 }
 
 _load_topology() {
@@ -916,8 +1145,32 @@ _build_worker_cpu_list() {
 
   WORKER_CPUS=("${WORKER_PRIMARY_CPUS[@]}")
   if [ "$use_ht" != "0" ]; then
-    for cpu in "${LOCAL_SIBLING[@]}"; do WORKER_CPUS+=("$cpu"); done
-    for cpu in "${REMOTE_SIBLING[@]}"; do WORKER_CPUS+=("$cpu"); done
+    case "$target" in
+      all|max|auto|'')
+        for cpu in "${LOCAL_SIBLING[@]}"; do WORKER_CPUS+=("$cpu"); done
+        for cpu in "${REMOTE_SIBLING[@]}"; do WORKER_CPUS+=("$cpu"); done
+        ;;
+      local)
+        for cpu in "${LOCAL_SIBLING[@]}"; do WORKER_CPUS+=("$cpu"); done
+        ;;
+      *[!0-9]*)
+        for cpu in "${LOCAL_SIBLING[@]}"; do WORKER_CPUS+=("$cpu"); done
+        for cpu in "${REMOTE_SIBLING[@]}"; do WORKER_CPUS+=("$cpu"); done
+        ;;
+      *)
+        local sibling_limit="${target:-0}"
+        for cpu in "${LOCAL_SIBLING[@]}"; do
+          [ "${#WORKER_CPUS[@]}" -ge $(( target + sibling_limit )) ] && break
+          WORKER_CPUS+=("$cpu")
+        done
+        if [ "${#WORKER_CPUS[@]}" -lt $(( target + sibling_limit )) ]; then
+          for cpu in "${REMOTE_SIBLING[@]}"; do
+            [ "${#WORKER_CPUS[@]}" -ge $(( target + sibling_limit )) ] && break
+            WORKER_CPUS+=("$cpu")
+          done
+        fi
+        ;;
+    esac
   fi
 
   if [ "${#WORKER_CPUS[@]}" -eq 0 ]; then
@@ -947,12 +1200,12 @@ _calc_auto_queue_base() {
     else
       target_q="$worker_primary"
     fi
-    [ "$target_q" -gt 16 ] && target_q=16
+    [ "$target_q" -gt 32 ] && target_q=32
   else
     case "$speed" in
       ''|*[!0-9]*)
         target_q="$worker_primary"
-        [ "$target_q" -gt 16 ] && target_q=16
+        [ "$target_q" -gt 32 ] && target_q=32
         ;;
       *)
         if [ "$speed" -ge 100000 ]; then
@@ -1031,6 +1284,8 @@ _build_irq_cpu_list() {
 _apply_queue_count() {
   local target="$1" max_combined cur
 
+  case "$target" in ''|*[!0-9]*|0) target=1 ;; esac
+
   if ethtool -l "$DEV" >/dev/null 2>&1; then
     max_combined=$(_get_max_combined)
     if [ -n "$max_combined" ] && [ "$max_combined" != "n/a" ] && [ "$max_combined" -gt 0 ] && [ "$target" -gt "$max_combined" ]; then
@@ -1044,7 +1299,13 @@ _apply_queue_count() {
   fi
 
   cur=$(_get_current_combined || true)
-  [ -n "$cur" ] && echo "$cur" || echo "$target"
+  case "$cur" in
+    ''|*[!0-9]*|0)
+      cur=$(find "/sys/class/net/$DEV/queues" -maxdepth 1 -type d -name 'rx-*' 2>/dev/null | awk 'END {print NR + 0}')
+      ;;
+  esac
+  case "$cur" in ''|*[!0-9]*|0) cur="$target" ;; esac
+  echo "$cur"
 }
 
 _apply_max_rings() {
@@ -1234,22 +1495,53 @@ _bitmap_for_all_workers() {
   _cpulist_to_mask "$csv"
 }
 
-_apply_irq_affinity() {
-  local i irq cpu effective
-  IRQ_AFFINITY_OK=1
-  if [ "${#IRQS[@]}" -gt 0 ]; then
-    for ((i = 0; i < ${#IRQS[@]}; i++)); do
-      irq="${IRQS[$i]}"
-      cpu="${IRQ_CPUS[$(( i % ${#IRQ_CPUS[@]} ))]}"
-      if [ -w "/proc/irq/$irq/smp_affinity_list" ]; then
-        echo "$cpu" > "/proc/irq/$irq/smp_affinity_list" 2>/dev/null || true
-        effective=$(cat "/proc/irq/$irq/effective_affinity_list" 2>/dev/null || cat "/proc/irq/$irq/smp_affinity_list" 2>/dev/null || true)
-        [ "$effective" = "$cpu" ] || IRQ_AFFINITY_OK=0
-      else
-        IRQ_AFFINITY_OK=0
-      fi
-    done
+_sync_flow_limit() {
+  local mode current mask before owned
+  mode="${ENABLE_FLOW_LIMIT:-0}"
+  if [ "$mode" = "1" ] || [ "$mode" = "on" ] || [ "$mode" = "yes" ]; then
+    [ -e /proc/sys/net/core/flow_limit_cpu_bitmap ] || return 0
+    current=$(cat /proc/sys/net/core/flow_limit_cpu_bitmap 2>/dev/null || true)
+    if [ ! -f "$FLOW_LIMIT_BEFORE" ]; then
+      printf '%s\n' "$current" > "$FLOW_LIMIT_BEFORE"
+    fi
+    mask=$(_bitmap_for_all_workers)
+    printf '%s\n' "$mask" > /proc/sys/net/core/flow_limit_cpu_bitmap 2>/dev/null || return 0
+    if [ "$(cat /proc/sys/net/core/flow_limit_cpu_bitmap 2>/dev/null || true)" = "$mask" ]; then
+      printf '%s\n' "$mask" > "$FLOW_LIMIT_OWNED"
+    fi
+    return 0
   fi
+
+  [ -f "$FLOW_LIMIT_BEFORE" ] && [ -f "$FLOW_LIMIT_OWNED" ] || return 0
+  before=$(cat "$FLOW_LIMIT_BEFORE" 2>/dev/null || true)
+  owned=$(cat "$FLOW_LIMIT_OWNED" 2>/dev/null || true)
+  current=$(cat /proc/sys/net/core/flow_limit_cpu_bitmap 2>/dev/null || true)
+  if [ -n "$before" ] && [ "$current" = "$owned" ] && [ -w /proc/sys/net/core/flow_limit_cpu_bitmap ]; then
+    printf '%s\n' "$before" > /proc/sys/net/core/flow_limit_cpu_bitmap 2>/dev/null || true
+  fi
+  rm -f "$FLOW_LIMIT_BEFORE" "$FLOW_LIMIT_OWNED"
+}
+
+_apply_irq_affinity() {
+  local i irq cpu effective queue
+  IRQ_AFFINITY_OK=0
+  [ "${IRQ_MAPPING_COMPLETE:-0}" = "1" ] || return 0
+  [ "${#IRQS[@]}" -gt 0 ] || return 0
+  [ "${#IRQ_CPUS[@]}" -gt 0 ] || return 0
+  IRQ_AFFINITY_OK=1
+  for ((i = 0; i < ${#IRQS[@]}; i++)); do
+    irq="${IRQS[$i]}"
+    queue="${IRQ_QUEUE_IDS[$i]:-}"
+    case "$queue" in ''|*[!0-9]*) IRQ_AFFINITY_OK=0; continue ;; esac
+    cpu="${IRQ_CPUS[$(( queue % ${#IRQ_CPUS[@]} ))]}"
+    if [ -w "/proc/irq/$irq/smp_affinity_list" ]; then
+      echo "$cpu" > "/proc/irq/$irq/smp_affinity_list" 2>/dev/null || true
+      effective=$(cat "/proc/irq/$irq/effective_affinity_list" 2>/dev/null || cat "/proc/irq/$irq/smp_affinity_list" 2>/dev/null || true)
+      [ "$effective" = "$cpu" ] || IRQ_AFFINITY_OK=0
+    else
+      IRQ_AFFINITY_OK=0
+    fi
+  done
 }
 
 _apply_xps() {
@@ -1267,8 +1559,8 @@ _apply_xps() {
 }
 
 _apply_rps_rfs() {
-  local enable total_flows perq i irqcpu csv mask worker_cnt cpu
-  local -a cpu_list
+  local enable total_flows current_flows minimum_flows perq i irqcpu csv mask worker_cnt cpu
+  local -a cpu_list filtered_cpus
   worker_cnt="${#WORKER_CPUS[@]}"
   enable="${ENABLE_RPS:-auto}"
 
@@ -1281,7 +1573,12 @@ _apply_rps_rfs() {
   elif [ "$enable" = "1" ] || [ "$enable" = "on" ] || [ "$enable" = "yes" ]; then
     enable="yes"
   else
-    if [ "${#RXQS[@]}" -lt "$worker_cnt" ] && [ "$worker_cnt" -gt 1 ]; then
+    # Topology CPUs are not application worker threads.  Keep RPS off for a
+    # user-space relay by default; enable it automatically for kernel
+    # forwarding, where it can actually move work between NAPI CPUs.
+    if [ "${RPS_FORWARD_ONLY:-1}" = "1" ] && [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)" != "1" ]; then
+      enable="no"
+    elif [ "${IRQ_MAPPING_COMPLETE:-0}" = "1" ] && [ "${#RXQS[@]}" -lt "$worker_cnt" ] && [ "$worker_cnt" -gt 1 ]; then
       enable="yes"
     else
       enable="no"
@@ -1295,15 +1592,25 @@ _apply_rps_rfs() {
       *) : ;;
     esac
 
+    minimum_flows=$(( ${#RXQS[@]} * 1024 ))
+    [ "$total_flows" -lt "$minimum_flows" ] && total_flows="$minimum_flows"
+    current_flows=$(cat /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || echo 0)
+    case "$current_flows" in ''|*[!0-9]*) current_flows=0 ;; esac
+    [ "$current_flows" -gt "$total_flows" ] && total_flows="$current_flows"
     echo "$total_flows" > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
     perq=$(( total_flows / ${#RXQS[@]} ))
-    [ "$perq" -lt 1024 ] && perq=1024
+    [ "$perq" -lt 1 ] && perq=1
 
     for ((i = 0; i < ${#RXQS[@]}; i++)); do
       irqcpu="${IRQ_CPUS[$(( i % ${#IRQ_CPUS[@]} ))]}"
       cpu_list=()
+      filtered_cpus=()
 
       mapfile -t cpu_list < <(_build_group_for_queue "$i" "${#RXQS[@]}")
+      for cpu in "${cpu_list[@]}"; do
+        [ "$cpu" = "$irqcpu" ] || filtered_cpus+=("$cpu")
+      done
+      [ "${#filtered_cpus[@]}" -eq 0 ] || cpu_list=("${filtered_cpus[@]}")
       if [ "${#cpu_list[@]}" -gt "${RPS_CPUS_PER_QUEUE:-2}" ]; then
         cpu_list=("${cpu_list[@]:0:${RPS_CPUS_PER_QUEUE:-2}}")
       fi
@@ -1315,17 +1622,13 @@ _apply_rps_rfs() {
       [ -w "${RXQS[$i]}/rps_flow_cnt" ] && echo "$perq" > "${RXQS[$i]}/rps_flow_cnt" 2>/dev/null || true
     done
 
-    if [ -e /proc/sys/net/core/flow_limit_cpu_bitmap ] && [ "${ENABLE_FLOW_LIMIT:-auto}" != "0" ] && [ "${ENABLE_FLOW_LIMIT:-auto}" != "off" ]; then
-      echo "$(_bitmap_for_all_workers)" > /proc/sys/net/core/flow_limit_cpu_bitmap 2>/dev/null || true
-    fi
   else
     for Q in "${RXQS[@]}"; do
       [ -w "$Q/rps_cpus" ] && echo 0 > "$Q/rps_cpus" 2>/dev/null || true
       [ -w "$Q/rps_flow_cnt" ] && echo 0 > "$Q/rps_flow_cnt" 2>/dev/null || true
     done
-    echo 0 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
-    [ -e /proc/sys/net/core/flow_limit_cpu_bitmap ] && echo 0 > /proc/sys/net/core/flow_limit_cpu_bitmap 2>/dev/null || true
   fi
+  _sync_flow_limit
 }
 
 _maybe_disable_irqbalance() {
@@ -1356,11 +1659,51 @@ _maybe_disable_irqbalance() {
 }
 
 _collect_irqs() {
-  local path
+  local path device_tag=""
+  if [ -e "/sys/class/net/$DEV/device" ]; then
+    device_tag=$(basename "$(readlink -f "/sys/class/net/$DEV/device" 2>/dev/null || true)")
+  fi
   for path in /sys/class/net/"$DEV"/device/msi_irqs/*; do
     [ -e "$path" ] && basename "$path"
   done
-  awk -v dev="$DEV" '$0 ~ dev {gsub(":", "", $1); print $1}' /proc/interrupts
+  awk -v dev="$DEV" -v tag="$device_tag" '
+    $0 ~ dev || (tag != "" && $0 ~ tag) {gsub(":", "", $1); print $1}
+  ' /proc/interrupts
+}
+
+_collect_irq_map() {
+  local path device_tag=""
+  if [ -e "/sys/class/net/$DEV/device" ]; then
+    device_tag=$(basename "$(readlink -f "/sys/class/net/$DEV/device" 2>/dev/null || true)")
+  fi
+  awk -v dev="$DEV" -v tag="$device_tag" '
+    $0 ~ dev || (tag != "" && $0 ~ tag) {
+      irq=$1
+      gsub(":", "", irq)
+      action=tolower($0)
+      if (action ~ /(admin|config|mgmt|management|async|command)/) next
+      candidate=action
+      queue=""
+      if (candidate ~ /(txrx|tx-rx|rx|tx)[-_.]?[0-9]+/) {
+        sub(/^.*(txrx|tx-rx|rx|tx)[-_.]?/, "", candidate)
+        sub(/[^0-9].*$/, "", candidate)
+        queue=candidate
+      } else if (candidate ~ /(input|output)\.[0-9]+/) {
+        sub(/^.*(input|output)\./, "", candidate)
+        sub(/[^0-9].*$/, "", candidate)
+        queue=candidate
+      } else if (candidate ~ /comp[0-9]+/) {
+        sub(/^.*comp/, "", candidate)
+        sub(/[^0-9].*$/, "", candidate)
+        queue=candidate
+      } else if (candidate ~ /(queue|block)[-_.]?[0-9]+/) {
+        sub(/^.*(queue|block)[-_.]?/, "", candidate)
+        sub(/[^0-9].*$/, "", candidate)
+        queue=candidate
+      }
+      if (queue ~ /^[0-9]+$/ && irq ~ /^[0-9]+$/) print queue, irq
+    }
+  ' /proc/interrupts 2>/dev/null
 }
 
 if ! ip link show "$DEV" >/dev/null 2>&1; then
@@ -1372,10 +1715,10 @@ _build_worker_cpu_list
 [ "${#WORKER_CPUS[@]}" -gt 0 ] || { echo "未选出工作 CPU"; exit 1; }
 
 TARGET_QUEUES=$(_pick_target_queues)
-[ "$TARGET_QUEUES" -le 0 ] && TARGET_QUEUES=1
+case "$TARGET_QUEUES" in ''|*[!0-9]*|0) TARGET_QUEUES=1 ;; esac
 
 TARGET_QUEUES=$(_apply_queue_count "$TARGET_QUEUES")
-[ "$TARGET_QUEUES" -le 0 ] && TARGET_QUEUES=1
+case "$TARGET_QUEUES" in ''|*[!0-9]*|0) TARGET_QUEUES=1 ;; esac
 
 _build_irq_cpu_list "$TARGET_QUEUES"
 [ "${#IRQ_CPUS[@]}" -gt 0 ] || { echo "未选出 IRQ CPU"; exit 1; }
@@ -1387,7 +1730,37 @@ _apply_offloads
 
 mapfile -t RXQS < <(find "/sys/class/net/$DEV/queues" -maxdepth 1 -type d -name 'rx-*' | sort -V)
 mapfile -t TXQS < <(find "/sys/class/net/$DEV/queues" -maxdepth 1 -type d -name 'tx-*' | sort -V)
-mapfile -t IRQS < <(_collect_irqs | awk '!seen[$0]++' | sort -n)
+# ethtool may accept a requested queue count but leave a different count
+# active.  Drive affinity and RPS from the queues that really exist.
+if [ "${#RXQS[@]}" -gt 0 ]; then
+  TARGET_QUEUES="${#RXQS[@]}"
+  _build_irq_cpu_list "$TARGET_QUEUES"
+fi
+IRQS=()
+IRQ_QUEUE_IDS=()
+IRQ_MAPPING_COMPLETE=0
+local_line=""
+mapfile -t IRQ_MAP < <(_collect_irq_map | awk '!seen[$2]++' | sort -k1,1n -k2,2n)
+for local_line in "${IRQ_MAP[@]}"; do
+  queue="${local_line%% *}"
+  irq="${local_line#* }"
+  case "$queue:$irq" in
+    *[!0-9:]*|:*) continue ;;
+  esac
+  [ "$queue" -lt "${#RXQS[@]}" ] || continue
+  IRQ_QUEUE_IDS+=("$queue")
+  IRQS+=("$irq")
+done
+if [ "${#RXQS[@]}" -gt 0 ] && [ "${#IRQS[@]}" -gt 0 ]; then
+  IRQ_MAPPING_COMPLETE=1
+  for ((i = 0; i < ${#RXQS[@]}; i++)); do
+    queue_found=0
+    for queue in "${IRQ_QUEUE_IDS[@]}"; do
+      [ "$queue" = "$i" ] && queue_found=1
+    done
+    [ "$queue_found" -eq 1 ] || IRQ_MAPPING_COMPLETE=0
+  done
+fi
 
 _apply_irq_affinity
 _maybe_disable_irqbalance
@@ -1397,13 +1770,15 @@ _force_fq_qdisc
 
 WORKER_CSV=$(IFS=,; echo "${WORKER_CPUS[*]}")
 IRQ_CSV=$(IFS=,; echo "${IRQ_CPUS[*]}")
+LINK_SPEED=$(_get_link_speed || true)
 
 printf '网卡: %s\n' "$DEV"
 printf '驱动: %s\n' "$(_get_driver || echo unknown)"
-printf '链路速率: %s Mb/s\n' "$(_get_link_speed || echo unknown)"
-printf 'NUMA 节点: %s\n' "$(_get_nic_numa_node || echo -1)"
+printf '链路速率: %s\n' "$([ -n "$LINK_SPEED" ] && printf '%s Mb/s' "$LINK_SPEED" || printf 'unknown')"
+printf 'NUMA 节点: %s\n' "$(_resolve_nic_numa_node || echo -1)"
 printf '工作 CPU: %s\n' "$WORKER_CSV"
 printf 'IRQ CPU: %s\n' "$IRQ_CSV"
+printf 'IRQ 映射: %s\n' "${IRQ_MAPPING_COMPLETE:-0}" | sed 's/^IRQ 映射: 1$/IRQ 映射: queue-aware/;s/^IRQ 映射: 0$/IRQ 映射: unknown (保留 irqbalance)/'
 printf '工作 CPU 数: %s\n' "${#WORKER_CPUS[@]}"
 printf '目标队列: %s\n' "$TARGET_QUEUES"
 printf 'ring: %s\n' "$RING_RESULT"
@@ -1423,7 +1798,7 @@ build_nic_service() {
 [Unit]
 Description=Live Relay VPS NIC Tuning
 Wants=network-online.target
-After=network-online.target
+After=network-online.target irqbalance.service
 
 [Service]
 Type=oneshot
@@ -1476,6 +1851,7 @@ RING_MODE=${RING_MODE:-balanced}
 COALESCE_MODE=${COALESCE_MODE:-balanced}
 RFS_FLOW_ENTRIES=${RFS_FLOW_ENTRIES:-auto}
 ENABLE_RPS=${ENABLE_RPS:-auto}
+RPS_FORWARD_ONLY=${RPS_FORWARD_ONLY:-1}
 RPS_CPUS_PER_QUEUE=${RPS_CPUS_PER_QUEUE:-2}
 ENABLE_FLOW_LIMIT=${ENABLE_FLOW_LIMIT:-0}
 DISABLE_IRQBALANCE=${DISABLE_IRQBALANCE:-1}
@@ -1529,6 +1905,8 @@ capture_original_runtime() {
     printf 'ORIGINAL_TX_USECS=%q\n' "$(ethtool -c "$nic" 2>/dev/null | awk -F': ' '/tx-usecs:/ {print $2; exit}')"
     printf 'ORIGINAL_PAUSE_RX=%q\n' "$(ethtool -a "$nic" 2>/dev/null | awk -F': ' '/RX:/ {print $2; exit}')"
     printf 'ORIGINAL_PAUSE_TX=%q\n' "$(ethtool -a "$nic" 2>/dev/null | awk -F': ' '/TX:/ {print $2; exit}')"
+    printf 'ORIGINAL_RPS_SOCK_FLOW_ENTRIES=%q\n' "$(cat /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true)"
+    printf 'ORIGINAL_FLOW_LIMIT_CPU_BITMAP=%q\n' "$(cat /proc/sys/net/core/flow_limit_cpu_bitmap 2>/dev/null || true)"
   } > "$snapshot"
 
   ethtool -k "$nic" 2>/dev/null | awk -F': ' '
@@ -1542,12 +1920,7 @@ capture_original_runtime() {
   while read -r irq; do
     [ -r "/proc/irq/$irq/smp_affinity_list" ] || continue
     printf '%s\t%s\n' "$irq" "$(cat "/proc/irq/$irq/smp_affinity_list")" >> "$SNAPSHOT_DIR/irq-affinity.tsv"
-  done < <({
-    for path in /sys/class/net/"$nic"/device/msi_irqs/*; do
-      [ -e "$path" ] && basename "$path"
-    done
-    awk -v dev="$nic" '$0 ~ dev {gsub(":", "", $1); print $1}' /proc/interrupts
-  } | awk '!seen[$0]++')
+  done < <(collect_nic_irqs "$nic" | awk '!seen[$0]++')
 
   : > "$SNAPSHOT_DIR/queue-state.tsv"
   for path in /sys/class/net/"$nic"/queues/{rx,tx}-*/{rps_cpus,rps_flow_cnt,xps_cpus,xps_rxqs}; do
@@ -1615,6 +1988,13 @@ restore_original_runtime() {
     done < "$SNAPSHOT_DIR/cpu-power.tsv"
   fi
 
+  if [ -n "${ORIGINAL_RPS_SOCK_FLOW_ENTRIES:-}" ] && [ -w /proc/sys/net/core/rps_sock_flow_entries ]; then
+    printf '%s\n' "$ORIGINAL_RPS_SOCK_FLOW_ENTRIES" > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
+  fi
+  if [ -n "${ORIGINAL_FLOW_LIMIT_CPU_BITMAP:-}" ] && [ -w /proc/sys/net/core/flow_limit_cpu_bitmap ]; then
+    printf '%s\n' "$ORIGINAL_FLOW_LIMIT_CPU_BITMAP" > /proc/sys/net/core/flow_limit_cpu_bitmap 2>/dev/null || true
+  fi
+
   if command -v systemctl >/dev/null 2>&1; then
     [ "${IRQBALANCE_ENABLED:-unknown}" = "enabled" ] && systemctl enable irqbalance >/dev/null 2>&1 || true
     [ "${IRQBALANCE_ACTIVE:-unknown}" = "active" ] && systemctl start irqbalance >/dev/null 2>&1 || true
@@ -1640,21 +2020,41 @@ STABLE_FILE="$WORKDIR/stable-state.env"
 PAUSE_FILE="$WORKDIR/paused"
 METRICS_LOG="$WORKDIR/metrics.log"
 LOCK_DIR="$WORKDIR/controller.lock"
+CPU_PREV_FILE="$WORKDIR/cpu-window.prev"
+CPU_NOW_FILE="$WORKDIR/cpu-window.now"
 INTERVAL="${AUTO_INTERVAL:-10}"
 UP_WINDOWS="${AUTO_UP_WINDOWS:-3}"
-DOWN_WINDOWS="${AUTO_DOWN_WINDOWS:-6}"
+DOWN_WINDOWS="${AUTO_DOWN_WINDOWS:-12}"
+COOLDOWN_WINDOWS="${AUTO_COOLDOWN_WINDOWS:-6}"
+WARMUP_WINDOWS="${AUTO_WARMUP_WINDOWS:-3}"
 SOFTIRQ_HIGH="${SOFTIRQ_HIGH:-70}"
 SOFTIRQ_LOW="${SOFTIRQ_LOW:-35}"
+STEAL_HIGH="${STEAL_HIGH:-5}"
+CPU_COUNT="${ONLINE_CPUS:-1}"
+PHYSICAL_COUNT="${PHYSICAL_CORES:-$CPU_COUNT}"
+MEM_GB="${MEMORY_GB:-1}"
+NUMA_COUNT="${NUMA_NODES:-1}"
+RX_QUEUES="${RX_QUEUE_COUNT:-1}"
+NIC_DRIVER_NAME="${NIC_DRIVER:-unknown}"
 NIC_HELPER="/usr/local/sbin/live-relay-nic-apply.sh"
 case "$INTERVAL" in ''|*[!0-9]*|0) INTERVAL=10 ;; esac
 case "$UP_WINDOWS" in ''|*[!0-9]*|0) UP_WINDOWS=3 ;; esac
-case "$DOWN_WINDOWS" in ''|*[!0-9]*|0) DOWN_WINDOWS=6 ;; esac
+case "$DOWN_WINDOWS" in ''|*[!0-9]*|0) DOWN_WINDOWS=12 ;; esac
+case "$COOLDOWN_WINDOWS" in ''|*[!0-9]*) COOLDOWN_WINDOWS=6 ;; esac
+case "$WARMUP_WINDOWS" in ''|*[!0-9]*) WARMUP_WINDOWS=3 ;; esac
 case "$SOFTIRQ_HIGH" in ''|*[!0-9]*) SOFTIRQ_HIGH=70 ;; esac
 case "$SOFTIRQ_LOW" in ''|*[!0-9]*) SOFTIRQ_LOW=35 ;; esac
+case "$STEAL_HIGH" in ''|*[!0-9]*) STEAL_HIGH=5 ;; esac
+case "$CPU_COUNT" in ''|*[!0-9]*|0) CPU_COUNT=1 ;; esac
+case "$PHYSICAL_COUNT" in ''|*[!0-9]*|0) PHYSICAL_COUNT="$CPU_COUNT" ;; esac
+case "$MEM_GB" in ''|*[!0-9]*|0) MEM_GB=1 ;; esac
+case "$NUMA_COUNT" in ''|*[!0-9]*|0) NUMA_COUNT=1 ;; esac
+case "$RX_QUEUES" in ''|*[!0-9]*|0) RX_QUEUES=1 ;; esac
 mkdir -p "$WORKDIR"
 
 release_lock() {
   [ -f "$LOCK_DIR/pid" ] && [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ] || return 0
+  rm -f "$CPU_PREV_FILE" "$CPU_NOW_FILE"
   rm -rf "$LOCK_DIR"
 }
 
@@ -1679,32 +2079,109 @@ acquire_lock() {
 }
 
 read_counter() {
-  cat "$1" 2>/dev/null || echo 0
+  local value
+  value=$(cat "$1" 2>/dev/null || true)
+  case "$value" in
+    ''|*[!0-9]*) echo 0 ;;
+    *) echo "$value" ;;
+  esac
 }
 
 softnet_totals() {
   local line c1 c2 c3 rest dropped=0 squeezed=0
   while read -r line; do
     read -r c1 c2 c3 rest <<< "$line"
-    [ -n "${c2:-}" ] && dropped=$(( dropped + 16#$c2 ))
-    [ -n "${c3:-}" ] && squeezed=$(( squeezed + 16#$c3 ))
-  done < "$PROC_ROOT/net/softnet_stat"
+    case "${c2:-}" in ''|*[!0-9A-Fa-f]*) c2=0 ;; esac
+    case "${c3:-}" in ''|*[!0-9A-Fa-f]*) c3=0 ;; esac
+    dropped=$(( dropped + 16#$c2 ))
+    squeezed=$(( squeezed + 16#$c3 ))
+  done < "$PROC_ROOT/net/softnet_stat" 2>/dev/null
   printf '%s %s\n' "$dropped" "$squeezed"
 }
 
 cpu_totals() {
-  awk '/^cpu / {total=0; for (i=2; i<=NF; i++) total += $i; print total, $8; exit}' "$PROC_ROOT/stat"
+  awk '
+    /^cpu / {
+      total=0
+      last=(NF < 9 ? NF : 9)
+      for (i=2; i<=last; i++) total += $i
+      print total, $8+0, $9+0
+      printed=1
+      exit
+    }
+    END {if (!printed) print "0 0 0"}
+  ' "$PROC_ROOT/stat" 2>/dev/null
+}
+
+cpu_snapshot() {
+  awk '
+    /^cpu[0-9]+ / {
+      total=0
+      last=(NF < 9 ? NF : 9)
+      for (i=2; i<=last; i++) total += $i
+      print $1, total, $8+0, $9+0
+    }
+  ' "$PROC_ROOT/stat" 2>/dev/null
+}
+
+cpu_window_pressure() {
+  awk '
+    NR == FNR {
+      previous_total[$1]=$2
+      previous_soft[$1]=$3
+      previous_steal[$1]=$4
+      previous_count++
+      next
+    }
+    {
+      if (!($1 in previous_total)) {invalid=1; next}
+      current_count++
+      delta_total=$2-previous_total[$1]
+      delta_soft=$3-previous_soft[$1]
+      delta_steal=$4-previous_steal[$1]
+      if (delta_total <= 0 || delta_soft < 0 || delta_steal < 0) {invalid=1; next}
+      soft=int(delta_soft*100/delta_total)
+      steal=int(delta_steal*100/delta_total)
+      if (soft > max_soft) max_soft=soft
+      if (steal > max_steal) max_steal=steal
+      valid_count++
+    }
+    END {
+      if (valid_count == 0 || current_count != previous_count || invalid) print "0 0 0"
+      else print max_soft+0, max_steal+0, 1
+    }
+  ' "$1" "$2" 2>/dev/null
+}
+
+monotonic_millis() {
+  local value
+  value=$(awk '{printf "%.0f\n", $1*1000; exit}' "$PROC_ROOT/uptime" 2>/dev/null || true)
+  case "$value" in
+    ''|*[!0-9]*) echo $(( $(date +%s) * 1000 )) ;;
+    *) echo "$value" ;;
+  esac
 }
 
 driver_drops() {
-  ethtool -S "$DEV" 2>/dev/null | awk -F': ' '
-    /rx_missed|rx_no_buffer|rx_dropped|rx_discards|tx_dropped|tx_discards/ {
-      gsub(/^[ \t]+/, "", $2); if ($2 ~ /^[0-9]+$/) total += $2
+  ethtool -S "$DEV" 2>/dev/null | awk -F':' '
+    {
+      name=tolower($1)
+      value=$2
+      gsub(/^[ \t]+|[ \t]+$/, "", value)
+      if (value !~ /^[0-9]+$/) next
+      if (name ~ /(rx|tx)/ && name ~ /(drop|discard|miss|no.buffer)/) {
+        if (name ~ /(queue|rxq|txq|q[0-9]|_[0-9]+_)/) {
+          queue_total += value
+          queue_seen=1
+        } else {
+          aggregate_total += value
+        }
+      }
     }
-    END {print total + 0}'
+    END {if (queue_seen) print queue_total + 0; else print aggregate_total + 0}'
 }
 
-udp_drops() {
+udp_counters() {
   awk '
     $1 == "Udp:" && !seen {
       for (i=2; i<=NF; i++) header[i]=$i
@@ -1713,18 +2190,116 @@ udp_drops() {
     }
     $1 == "Udp:" && seen {
       for (i=2; i<=NF; i++) {
-        if (header[i] == "InErrors" || header[i] == "RcvbufErrors" || header[i] == "SndbufErrors") total += $i
+        if (header[i] == "InErrors") in_errors=$i
+        else if (header[i] == "RcvbufErrors") rcvbuf=$i
+        else if (header[i] == "SndbufErrors") sndbuf=$i
+      }
+      print in_errors + 0, rcvbuf + 0, sndbuf + 0
+      printed=1
+      exit
+    }
+    END {if (!printed) print "0 0 0"}
+  ' "$PROC_ROOT/net/snmp" 2>/dev/null
+}
+
+tcp_counters() {
+  awk '
+    $1 == "Tcp:" && !seen {
+      for (i=2; i<=NF; i++) header[i]=$i
+      seen=1
+      next
+    }
+    $1 == "Tcp:" && seen {
+      for (i=2; i<=NF; i++) {
+        if (header[i] == "RetransSegs") retrans=$i
+        else if (header[i] == "OutSegs") outsegs=$i
+      }
+      print retrans + 0, outsegs + 0
+      printed=1
+      exit
+    }
+    END {if (!printed) print "0 0"}
+  ' "$PROC_ROOT/net/snmp" 2>/dev/null
+}
+
+tcp_listen_drops() {
+  awk '
+    $1 == "TcpExt:" && !seen {
+      for (i=2; i<=NF; i++) header[i]=$i
+      seen=1
+      next
+    }
+    $1 == "TcpExt:" && seen {
+      for (i=2; i<=NF; i++) {
+        # ListenOverflows/TCPReqQFullDrop are often included in
+        # ListenDrops.  Use the kernel aggregate ListenDrops counter once
+        # instead of taking a max or adding overlapping counters.
+        if (header[i] == "ListenDrops") total=$i
       }
       print total + 0
       printed=1
       exit
     }
     END {if (!printed) print 0}
-  ' "$PROC_ROOT/net/snmp" 2>/dev/null
+  ' "$PROC_ROOT/net/netstat" 2>/dev/null
 }
 
-sysctl_set() {
-  [ -e "$PROC_ROOT/sys/${1//./\/}" ] && sysctl -q -w "$1=$2" >/dev/null 2>&1 || true
+qdisc_drops() {
+  tc -s qdisc show dev "$DEV" 2>/dev/null | awk '
+    /^qdisc / {
+      qdisc_type=$2
+      is_leaf = ($0 ~ / parent /) ? 1 : 0
+      is_data = (qdisc_type != "mq" && qdisc_type != "ingress" && qdisc_type != "clsact") ? 1 : 0
+      if (is_data && is_leaf) leaf_seen=1
+      next
+    }
+    {
+      for (i=1; i<=NF; i++) {
+        key=$i
+        gsub(/[()]/, "", key)
+        if (key == "dropped" && i < NF) {
+          value=$(i+1)
+          gsub(/[^0-9]/, "", value)
+          if (value ~ /^[0-9]+$/) {
+            if (is_data && is_leaf) leaf_total += value
+            else if (is_data) root_total += value
+          }
+        }
+      }
+    }
+    END {if (leaf_seen) print leaf_total + 0; else print root_total + 0}'
+}
+
+apply_parameter_group() {
+  local keys=(net.core.netdev_max_backlog net.core.netdev_budget net.core.netdev_budget_usecs net.core.dev_weight)
+  local values=("$ACTIVE_BACKLOG" "$ACTIVE_BUDGET" "$ACTIVE_BUDGET_USECS" "$ACTIVE_WEIGHT")
+  local old_values=() applied_indices=() i key value old actual path j
+  for ((i = 0; i < ${#keys[@]}; i++)); do
+    key="${keys[$i]}"; value="${values[$i]}"
+    path="$PROC_ROOT/sys/${key//.//}"
+    [ -e "$path" ] && [ -w "$path" ] || continue
+    old=$(sysctl -n "$key" 2>/dev/null | awk '{$1=$1; print}' || true)
+    [ -n "$old" ] || continue
+    old_values[$i]="$old"
+    if ! sysctl -q -w "$key=$value" >/dev/null 2>&1; then
+      for ((j = ${#applied_indices[@]} - 1; j >= 0; j--)); do
+        i="${applied_indices[$j]}"
+        sysctl -q -w "${keys[$i]}=${old_values[$i]}" >/dev/null 2>&1 || true
+      done
+      return 1
+    fi
+    actual=$(sysctl -n "$key" 2>/dev/null | awk '{$1=$1; print}' || true)
+    if [ "$actual" != "$value" ]; then
+      sysctl -q -w "$key=$old" >/dev/null 2>&1 || true
+      for ((j = ${#applied_indices[@]} - 1; j >= 0; j--)); do
+        i="${applied_indices[$j]}"
+        sysctl -q -w "${keys[$i]}=${old_values[$i]}" >/dev/null 2>&1 || true
+      done
+      return 1
+    fi
+    applied_indices+=("$i")
+  done
+  return 0
 }
 
 write_state() {
@@ -1734,9 +2309,24 @@ write_state() {
     printf 'LEVEL=%q\n' "$level"
     printf 'REASON=%q\n' "$reason"
     printf 'PPS=%q\n' "${CURRENT_PPS:-0}"
+    printf 'RX_BPS=%q\n' "${CURRENT_RX_BPS:-0}"
+    printf 'TX_BPS=%q\n' "${CURRENT_TX_BPS:-0}"
     printf 'SOFTIRQ_PCT=%q\n' "${CURRENT_SOFTIRQ:-0}"
+    printf 'STEAL_PCT=%q\n' "${CURRENT_STEAL:-0}"
     printf 'DROP_DELTA=%q\n' "${CURRENT_DROPS:-0}"
     printf 'SQUEEZE_DELTA=%q\n' "${CURRENT_SQUEEZE:-0}"
+    printf 'UDP_RCVBUF_DELTA=%q\n' "${CURRENT_UDP_RCVBUF:-0}"
+    printf 'UDP_SNDBUF_DELTA=%q\n' "${CURRENT_UDP_SNDBUF:-0}"
+    printf 'TCP_RETRANS_DELTA=%q\n' "${CURRENT_RETRANS:-0}"
+    printf 'TCP_RETRANS_BP=%q\n' "${CURRENT_RETRANS_BP:-0}"
+    printf 'LISTEN_DROP_DELTA=%q\n' "${CURRENT_LISTEN_DROPS:-0}"
+    printf 'QDISC_DROP_DELTA=%q\n' "${CURRENT_QDISC_DROPS:-0}"
+    printf 'PRESSURE_SCORE=%q\n' "${CURRENT_PRESSURE_SCORE:-0}"
+    printf 'MACHINE=%q\n' "${CPU_COUNT}c/${PHYSICAL_COUNT}p/${MEM_GB}G/${NUMA_COUNT}n/${RX_QUEUES}q/${NIC_DRIVER_NAME}"
+    printf 'ACTIVE_BACKLOG=%q\n' "${ACTIVE_BACKLOG:-0}"
+    printf 'ACTIVE_BUDGET=%q\n' "${ACTIVE_BUDGET:-0}"
+    printf 'ACTIVE_BUDGET_USECS=%q\n' "${ACTIVE_BUDGET_USECS:-0}"
+    printf 'COOLDOWN_REMAINING=%q\n' "${cooldown:-0}"
     printf 'UPDATED_AT=%q\n' "$(date +%F_%T)"
   } > "$tmp"
   mv -f "$tmp" "$STATE_FILE"
@@ -1744,111 +2334,322 @@ write_state() {
 
 write_stable() {
   local level="$1" tmp="$STABLE_FILE.tmp.$$"
-  printf 'LEVEL=%q\nSAVED_AT=%q\n' "$level" "$(date +%F_%T)" > "$tmp"
+  {
+    printf 'LEVEL=%q\n' "$level"
+    printf 'STABLE_BACKLOG=%q\n' "${ACTIVE_BACKLOG:-0}"
+    printf 'STABLE_BUDGET=%q\n' "${ACTIVE_BUDGET:-0}"
+    printf 'STABLE_BUDGET_USECS=%q\n' "${ACTIVE_BUDGET_USECS:-0}"
+    printf 'STABLE_WEIGHT=%q\n' "${ACTIVE_WEIGHT:-0}"
+    printf 'STABLE_MACHINE=%q\n' "${CPU_COUNT}c/${PHYSICAL_COUNT}p/${MEM_GB}G/${NUMA_COUNT}n/${RX_QUEUES}q/${NIC_DRIVER_NAME}"
+    printf 'SAVED_AT=%q\n' "$(date +%F_%T)"
+  } > "$tmp"
   mv -f "$tmp" "$STABLE_FILE"
 }
 
 append_metric() {
   local reason="$1" tmp="$METRICS_LOG.tmp.$$"
-  printf '%s level=%s pps=%s softirq=%s drops=%s squeeze=%s reason=%s\n' \
-    "$(date +%F_%T)" "$CURRENT_LEVEL" "${CURRENT_PPS:-0}" "${CURRENT_SOFTIRQ:-0}" \
-    "${CURRENT_DROPS:-0}" "${CURRENT_SQUEEZE:-0}" "$reason" >> "$METRICS_LOG"
+  printf '%s level=%s pps=%s rx_bps=%s tx_bps=%s softirq=%s steal=%s drops=%s squeeze=%s udp_rx=%s udp_tx=%s retrans=%s retrans_bp=%s listen=%s qdisc=%s score=%s reason=%s\n' \
+    "$(date +%F_%T)" "$CURRENT_LEVEL" "${CURRENT_PPS:-0}" "${CURRENT_RX_BPS:-0}" "${CURRENT_TX_BPS:-0}" "${CURRENT_SOFTIRQ:-0}" \
+    "${CURRENT_STEAL:-0}" "${CURRENT_DROPS:-0}" "${CURRENT_SQUEEZE:-0}" \
+    "${CURRENT_UDP_RCVBUF:-0}" "${CURRENT_UDP_SNDBUF:-0}" "${CURRENT_RETRANS:-0}" \
+    "${CURRENT_RETRANS_BP:-0}" "${CURRENT_LISTEN_DROPS:-0}" "${CURRENT_QDISC_DROPS:-0}" \
+    "${CURRENT_PRESSURE_SCORE:-0}" "$reason" >> "$METRICS_LOG"
   if [ "$(wc -l < "$METRICS_LOG" 2>/dev/null || echo 0)" -gt 2000 ]; then
     tail -n 2000 "$METRICS_LOG" > "$tmp" 2>/dev/null && mv -f "$tmp" "$METRICS_LOG"
   fi
   rm -f "$tmp"
 }
 
-apply_level() {
-  local level="$1" reason="${2:-automatic}" backlog budget usecs weight limit notsent coal
-  case "$level" in
-    0) backlog=16384; budget=500; usecs=2000; weight=64;  limit=262144;  notsent=32768;  coal=2 ;;
-    2) backlog=65536; budget=1400; usecs=8000; weight=256; limit=1048576; notsent=131072; coal=12 ;;
-    *) level=1; backlog=32768; budget=800; usecs=4000; weight=128; limit=524288; notsent=65536; coal=6 ;;
-  esac
+clamp_value() {
+  local value="$1" minimum="$2" maximum="$3"
+  [ "$value" -lt "$minimum" ] && value="$minimum"
+  [ "$value" -gt "$maximum" ] && value="$maximum"
+  echo "$value"
+}
 
-  sysctl_set net.core.netdev_max_backlog "$backlog"
-  sysctl_set net.core.netdev_budget "$budget"
-  sysctl_set net.core.netdev_budget_usecs "$usecs"
-  sysctl_set net.core.dev_weight "$weight"
-  sysctl_set net.ipv4.tcp_limit_output_bytes "$limit"
-  sysctl_set net.ipv4.tcp_notsent_lowat "$notsent"
-  ethtool -C "$DEV" adaptive-rx off adaptive-tx off rx-usecs "$coal" tx-usecs "$coal" >/dev/null 2>&1 || true
+calculate_level_parameters() {
+  local level="$1" data_cpus memory_cap pps pps_per horizon slice candidate
+  pps="${CURRENT_PPS:-0}"
+  case "$pps" in ''|*[!0-9]*) pps=0 ;; esac
+  data_cpus="$PHYSICAL_COUNT"
+  [ "$RX_QUEUES" -lt "$data_cpus" ] && data_cpus="$RX_QUEUES"
+  [ "$data_cpus" -gt 0 ] || data_cpus=1
+  pps_per=$(( pps / data_cpus ))
+  memory_cap=$(( MEM_GB * 1073741824 / 50 / data_cpus / 2048 ))
+  memory_cap=$(clamp_value "$memory_cap" 32768 131072)
+
+  case "$level" in
+    0)
+      horizon=4000; slice=250
+      candidate=$(( pps_per * horizon / 1000000 ))
+      ACTIVE_BACKLOG=$(clamp_value "$candidate" 8192 "$memory_cap")
+      candidate=$(( pps_per * slice / 1000000 ))
+      ACTIVE_BUDGET=$(clamp_value "$candidate" 300 600)
+      ACTIVE_BUDGET_USECS=1500
+      [ "$pps_per" -ge 150000 ] && ACTIVE_BUDGET_USECS=2000
+      [ "$pps_per" -ge 400000 ] && ACTIVE_BUDGET_USECS=2500
+      ACTIVE_WEIGHT=64; ACTIVE_COALESCE=2
+      ACTIVE_BUDGET=$(clamp_value "$ACTIVE_BUDGET" 300 600)
+      ACTIVE_BUDGET_USECS=$(clamp_value "$ACTIVE_BUDGET_USECS" 1500 3000)
+      ;;
+    2)
+      horizon=32000; slice=1000
+      candidate=$(( pps_per * horizon / 1000000 ))
+      ACTIVE_BACKLOG=$(clamp_value "$candidate" 32768 "$memory_cap")
+      candidate=$(( pps_per * slice / 1000000 ))
+      ACTIVE_BUDGET=$(clamp_value "$candidate" 900 1800)
+      ACTIVE_BUDGET_USECS=4000
+      [ "$pps_per" -ge 150000 ] && ACTIVE_BUDGET_USECS=5000
+      [ "$pps_per" -ge 400000 ] && ACTIVE_BUDGET_USECS=6000
+      [ "$pps_per" -ge 800000 ] && ACTIVE_BUDGET_USECS=7000
+      ACTIVE_WEIGHT=256
+      if [ "$pps" -ge 200000 ]; then ACTIVE_COALESCE=12; else ACTIVE_COALESCE=8; fi
+      ACTIVE_BUDGET_USECS=$(clamp_value "$ACTIVE_BUDGET_USECS" 4000 8000)
+      ;;
+    *)
+      horizon=12000; slice=500
+      candidate=$(( pps_per * horizon / 1000000 ))
+      ACTIVE_BACKLOG=$(clamp_value "$candidate" 16384 "$memory_cap")
+      candidate=$(( pps_per * slice / 1000000 ))
+      ACTIVE_BUDGET=$(clamp_value "$candidate" 600 1100)
+      ACTIVE_BUDGET_USECS=2500
+      [ "$pps_per" -ge 150000 ] && ACTIVE_BUDGET_USECS=3000
+      [ "$pps_per" -ge 400000 ] && ACTIVE_BUDGET_USECS=3500
+      ACTIVE_WEIGHT=128; ACTIVE_COALESCE=6
+      ACTIVE_BUDGET=$(clamp_value "$ACTIVE_BUDGET" 600 1100)
+      ACTIVE_BUDGET_USECS=$(clamp_value "$ACTIVE_BUDGET_USECS" 2500 4500)
+      ;;
+  esac
+}
+
+apply_level() {
+  local level="$1" reason="${2:-automatic}"
+  case "$level" in 0|1|2) : ;; *) level=1 ;; esac
+  calculate_level_parameters "$level"
+
+  if ! apply_parameter_group; then
+    write_state "${CURRENT_LEVEL:-$level}" actuator_rollback
+    return 1
+  fi
+  # Coalescing is set once by the NIC calibration helper.  Keep it out of the
+  # short control loop: a driver may silently clamp or reject ethtool writes,
+  # and changing it without read-back would break the actuator transaction.
   write_state "$level" "$reason"
   CURRENT_LEVEL="$level"
 }
 
 apply_stable() {
-  local level=1
+  local level=1 machine="${CPU_COUNT}c/${PHYSICAL_COUNT}p/${MEM_GB}G/${NUMA_COUNT}n/${RX_QUEUES}q/${NIC_DRIVER_NAME}"
   if [ -f "$STABLE_FILE" ]; then
     source "$STABLE_FILE"
     level="${LEVEL:-1}"
+  fi
+  if [ "${STABLE_MACHINE:-}" = "$machine" ] && \
+     [[ "${STABLE_BACKLOG:-}" =~ ^[0-9]+$ ]] && [[ "${STABLE_BUDGET:-}" =~ ^[0-9]+$ ]] && \
+     [[ "${STABLE_BUDGET_USECS:-}" =~ ^[0-9]+$ ]] && [[ "${STABLE_WEIGHT:-}" =~ ^[0-9]+$ ]]; then
+    ACTIVE_BACKLOG="$STABLE_BACKLOG"; ACTIVE_BUDGET="$STABLE_BUDGET"
+    ACTIVE_BUDGET_USECS="$STABLE_BUDGET_USECS"; ACTIVE_WEIGHT="$STABLE_WEIGHT"
+    if apply_parameter_group; then
+      CURRENT_LEVEL="$level"
+      write_state "$level" stable_rollback
+      return 0
+    fi
   fi
   apply_level "$level" stable_rollback
 }
 
 calibrate() {
   [ -x "$NIC_HELPER" ] && "$NIC_HELPER" >/dev/null 2>&1 || true
-  apply_level 1 calibrated_balanced
+  apply_level 1 calibrated_balanced || return 1
   write_stable 1
 }
 
 controller_loop() {
-  local prev_rx prev_tx prev_soft_drop prev_squeeze prev_driver prev_udp prev_total prev_soft
-  local now_rx now_tx now_soft_drop now_squeeze now_driver now_udp now_total now_soft
-  local d_total d_soft d_rx d_tx d_soft_drop d_squeeze d_driver d_udp
-  local pressure=0 calm=0 stable=0 reason
+  local prev_rx prev_tx prev_rx_bytes prev_tx_bytes prev_soft_drop prev_squeeze prev_driver prev_total prev_soft prev_steal prev_ts
+  local prev_udp_in prev_udp_rcv prev_udp_snd prev_retrans prev_outsegs prev_listen prev_qdisc
+  local now_rx now_tx now_rx_bytes now_tx_bytes now_soft_drop now_squeeze now_driver now_total now_soft now_steal now_ts
+  local now_udp_in now_udp_rcv now_udp_snd now_retrans now_outsegs now_listen now_qdisc
+  local elapsed d_total d_soft d_steal d_rx d_tx d_rx_bytes d_tx_bytes d_soft_drop d_squeeze d_driver
+  local d_udp_in d_udp_rcv d_udp_snd d_udp_effective d_retrans d_outsegs d_listen d_qdisc
+  local pressure=0 calm=0 stable=0 cooldown=0 warmup="$WARMUP_WINDOWS" reason
+  local counter_reset=0 metric_invalid=0 cpu_sample_valid=0 path
+  prev_rx=0; prev_tx=0; prev_rx_bytes=0; prev_tx_bytes=0
+  prev_soft_drop=0; prev_squeeze=0; prev_driver=0; prev_total=0; prev_soft=0; prev_steal=0
+  prev_udp_in=0; prev_udp_rcv=0; prev_udp_snd=0; prev_retrans=0; prev_outsegs=0
+  prev_listen=0; prev_qdisc=0; prev_ts=0
+  now_rx=0; now_tx=0; now_rx_bytes=0; now_tx_bytes=0
+  now_soft_drop=0; now_squeeze=0; now_driver=0; now_total=0; now_soft=0; now_steal=0; now_ts=0
+  now_udp_in=0; now_udp_rcv=0; now_udp_snd=0; now_retrans=0; now_outsegs=0; now_listen=0; now_qdisc=0
   CURRENT_LEVEL=1
   [ -f "$STATE_FILE" ] && source "$STATE_FILE" 2>/dev/null || true
   CURRENT_LEVEL="${LEVEL:-1}"
+  cooldown="${COOLDOWN_REMAINING:-0}"
+  case "$cooldown" in ''|*[!0-9]*) cooldown=0 ;; esac
+  [ "$cooldown" -gt "$COOLDOWN_WINDOWS" ] && cooldown="$COOLDOWN_WINDOWS"
 
   read -r prev_soft_drop prev_squeeze < <(softnet_totals)
-  read -r prev_total prev_soft < <(cpu_totals)
+  read -r prev_total prev_soft prev_steal < <(cpu_totals)
+  cpu_snapshot > "$CPU_PREV_FILE"
   prev_rx=$(read_counter "$SYS_ROOT/class/net/$DEV/statistics/rx_packets")
   prev_tx=$(read_counter "$SYS_ROOT/class/net/$DEV/statistics/tx_packets")
+  prev_rx_bytes=$(read_counter "$SYS_ROOT/class/net/$DEV/statistics/rx_bytes")
+  prev_tx_bytes=$(read_counter "$SYS_ROOT/class/net/$DEV/statistics/tx_bytes")
   prev_driver=$(driver_drops)
-  prev_udp=$(udp_drops)
-  apply_level "$CURRENT_LEVEL" controller_started
+  read -r prev_udp_in prev_udp_rcv prev_udp_snd < <(udp_counters)
+  read -r prev_retrans prev_outsegs < <(tcp_counters)
+  prev_listen=$(tcp_listen_drops)
+  prev_qdisc=$(qdisc_drops)
+  prev_ts=$(monotonic_millis)
+  apply_level "$CURRENT_LEVEL" controller_started || return 1
 
   while sleep "$INTERVAL"; do
+    metric_invalid=0
+    for path in \
+      "$PROC_ROOT/stat" \
+      "$PROC_ROOT/net/softnet_stat" \
+      "$SYS_ROOT/class/net/$DEV/statistics/rx_packets" \
+      "$SYS_ROOT/class/net/$DEV/statistics/tx_packets" \
+      "$SYS_ROOT/class/net/$DEV/statistics/rx_bytes" \
+      "$SYS_ROOT/class/net/$DEV/statistics/tx_bytes"; do
+      [ -r "$path" ] || metric_invalid=1
+    done
     read -r now_soft_drop now_squeeze < <(softnet_totals)
-    read -r now_total now_soft < <(cpu_totals)
+    read -r now_total now_soft now_steal < <(cpu_totals)
+    cpu_snapshot > "$CPU_NOW_FILE"
     now_rx=$(read_counter "$SYS_ROOT/class/net/$DEV/statistics/rx_packets")
     now_tx=$(read_counter "$SYS_ROOT/class/net/$DEV/statistics/tx_packets")
+    now_rx_bytes=$(read_counter "$SYS_ROOT/class/net/$DEV/statistics/rx_bytes")
+    now_tx_bytes=$(read_counter "$SYS_ROOT/class/net/$DEV/statistics/tx_bytes")
     now_driver=$(driver_drops)
-    now_udp=$(udp_drops)
+    read -r now_udp_in now_udp_rcv now_udp_snd < <(udp_counters)
+    read -r now_retrans now_outsegs < <(tcp_counters)
+    now_listen=$(tcp_listen_drops)
+    now_qdisc=$(qdisc_drops)
+    now_ts=$(monotonic_millis)
+    elapsed=$(( now_ts - prev_ts )); [ "$elapsed" -gt 0 ] || elapsed=$(( INTERVAL * 1000 ))
 
     d_total=$(( now_total - prev_total ))
     d_soft=$(( now_soft - prev_soft ))
+    d_steal=$(( now_steal - prev_steal ))
+    counter_reset=0
+    [ "$d_total" -lt 0 ] && counter_reset=1
+    [ "$d_soft" -lt 0 ] && counter_reset=1
+    [ "$d_steal" -lt 0 ] && counter_reset=1
     if [ "$d_total" -gt 0 ] && [ "$d_soft" -ge 0 ]; then
       CURRENT_SOFTIRQ=$(( d_soft * 100 / d_total ))
     else
       CURRENT_SOFTIRQ=0
     fi
-    d_rx=$(( now_rx - prev_rx )); [ "$d_rx" -ge 0 ] || d_rx=0
-    d_tx=$(( now_tx - prev_tx )); [ "$d_tx" -ge 0 ] || d_tx=0
-    d_soft_drop=$(( now_soft_drop - prev_soft_drop )); [ "$d_soft_drop" -ge 0 ] || d_soft_drop=0
-    d_squeeze=$(( now_squeeze - prev_squeeze )); [ "$d_squeeze" -ge 0 ] || d_squeeze=0
-    d_driver=$(( now_driver - prev_driver )); [ "$d_driver" -ge 0 ] || d_driver=0
-    d_udp=$(( now_udp - prev_udp )); [ "$d_udp" -ge 0 ] || d_udp=0
-    CURRENT_PPS=$(( (d_rx + d_tx) / INTERVAL ))
-    CURRENT_DROPS=$(( d_soft_drop + d_driver + d_udp ))
+    if [ "$d_total" -gt 0 ] && [ "$d_steal" -ge 0 ]; then
+      CURRENT_STEAL=$(( d_steal * 100 / d_total ))
+    else
+      CURRENT_STEAL=0
+    fi
+    cpu_sample_valid=0
+    read -r CURRENT_SOFTIRQ CURRENT_STEAL cpu_sample_valid < <(cpu_window_pressure "$CPU_PREV_FILE" "$CPU_NOW_FILE")
+    mv -f "$CPU_NOW_FILE" "$CPU_PREV_FILE"
+    [ "$cpu_sample_valid" = "1" ] || metric_invalid=1
+    d_rx=$(( now_rx - prev_rx )); [ "$d_rx" -ge 0 ] || { d_rx=0; counter_reset=1; }
+    d_tx=$(( now_tx - prev_tx )); [ "$d_tx" -ge 0 ] || { d_tx=0; counter_reset=1; }
+    d_rx_bytes=$(( now_rx_bytes - prev_rx_bytes )); [ "$d_rx_bytes" -ge 0 ] || { d_rx_bytes=0; counter_reset=1; }
+    d_tx_bytes=$(( now_tx_bytes - prev_tx_bytes )); [ "$d_tx_bytes" -ge 0 ] || { d_tx_bytes=0; counter_reset=1; }
+    d_soft_drop=$(( now_soft_drop - prev_soft_drop )); [ "$d_soft_drop" -ge 0 ] || { d_soft_drop=0; counter_reset=1; }
+    d_squeeze=$(( now_squeeze - prev_squeeze )); [ "$d_squeeze" -ge 0 ] || { d_squeeze=0; counter_reset=1; }
+    d_driver=$(( now_driver - prev_driver )); [ "$d_driver" -ge 0 ] || { d_driver=0; counter_reset=1; }
+    d_udp_in=$(( now_udp_in - prev_udp_in )); [ "$d_udp_in" -ge 0 ] || { d_udp_in=0; counter_reset=1; }
+    d_udp_rcv=$(( now_udp_rcv - prev_udp_rcv )); [ "$d_udp_rcv" -ge 0 ] || { d_udp_rcv=0; counter_reset=1; }
+    d_udp_snd=$(( now_udp_snd - prev_udp_snd )); [ "$d_udp_snd" -ge 0 ] || { d_udp_snd=0; counter_reset=1; }
+    d_retrans=$(( now_retrans - prev_retrans )); [ "$d_retrans" -ge 0 ] || { d_retrans=0; counter_reset=1; }
+    d_outsegs=$(( now_outsegs - prev_outsegs )); [ "$d_outsegs" -ge 0 ] || { d_outsegs=0; counter_reset=1; }
+    d_listen=$(( now_listen - prev_listen )); [ "$d_listen" -ge 0 ] || { d_listen=0; counter_reset=1; }
+    d_qdisc=$(( now_qdisc - prev_qdisc )); [ "$d_qdisc" -ge 0 ] || { d_qdisc=0; counter_reset=1; }
+    d_udp_effective="$d_udp_in"
+    [ "$d_udp_rcv" -gt "$d_udp_effective" ] && d_udp_effective="$d_udp_rcv"
+    d_udp_effective=$(( d_udp_effective + d_udp_snd ))
+    CURRENT_PPS=$(( (d_rx + d_tx) * 1000 / elapsed ))
+    CURRENT_RX_BPS=$(( d_rx_bytes * 8000 / elapsed ))
+    CURRENT_TX_BPS=$(( d_tx_bytes * 8000 / elapsed ))
+    CURRENT_UDP_RCVBUF="$d_udp_rcv"
+    CURRENT_UDP_SNDBUF="$d_udp_snd"
+    CURRENT_RETRANS="$d_retrans"
+    if [ "$d_outsegs" -gt 0 ]; then
+      CURRENT_RETRANS_BP=$(( d_retrans * 10000 / d_outsegs ))
+    elif [ "$d_retrans" -gt 0 ]; then
+      # Retransmissions without a matching OutSegs sample are still a loss
+      # signal; treating them as 0 would incorrectly permit a downshift.
+      CURRENT_RETRANS_BP=10000
+    else
+      CURRENT_RETRANS_BP=0
+    fi
+    CURRENT_LISTEN_DROPS="$d_listen"
+    CURRENT_QDISC_DROPS="$d_qdisc"
+    CURRENT_DROPS=$(( d_soft_drop + d_driver + d_udp_effective + d_listen + d_qdisc ))
     CURRENT_SQUEEZE="$d_squeeze"
+    CURRENT_PRESSURE_SCORE=0
+    [ $(( d_soft_drop + d_driver )) -gt 0 ] && CURRENT_PRESSURE_SCORE=$(( CURRENT_PRESSURE_SCORE + 4 ))
+    [ "$d_squeeze" -gt 0 ] && CURRENT_PRESSURE_SCORE=$(( CURRENT_PRESSURE_SCORE + 3 ))
+    [ "$CURRENT_SOFTIRQ" -ge "$SOFTIRQ_HIGH" ] && CURRENT_PRESSURE_SCORE=$(( CURRENT_PRESSURE_SCORE + 3 ))
 
     prev_soft_drop="$now_soft_drop"; prev_squeeze="$now_squeeze"
-    prev_total="$now_total"; prev_soft="$now_soft"
-    prev_rx="$now_rx"; prev_tx="$now_tx"; prev_driver="$now_driver"; prev_udp="$now_udp"
+    prev_total="$now_total"; prev_soft="$now_soft"; prev_steal="$now_steal"
+    prev_rx="$now_rx"; prev_tx="$now_tx"; prev_driver="$now_driver"
+    prev_rx_bytes="$now_rx_bytes"; prev_tx_bytes="$now_tx_bytes"; prev_ts="$now_ts"
+    prev_udp_in="$now_udp_in"; prev_udp_rcv="$now_udp_rcv"; prev_udp_snd="$now_udp_snd"
+    prev_retrans="$now_retrans"; prev_outsegs="$now_outsegs"
+    prev_listen="$now_listen"; prev_qdisc="$now_qdisc"
+    [ "$cooldown" -gt 0 ] && cooldown=$(( cooldown - 1 ))
 
     if [ -e "$PAUSE_FILE" ]; then
       write_state "$CURRENT_LEVEL" user_paused paused
-      pressure=0; calm=0
+      pressure=0; calm=0; stable=0
+      continue
+    fi
+
+    if [ "$metric_invalid" -ne 0 ]; then
+      pressure=0; calm=0; stable=0; warmup="$WARMUP_WINDOWS"
+      write_state "$CURRENT_LEVEL" metrics_unavailable
+      append_metric metrics_unavailable
+      continue
+    fi
+
+    if [ "$counter_reset" -ne 0 ]; then
+      pressure=0; calm=0; stable=0; warmup="$WARMUP_WINDOWS"
+      write_state "$CURRENT_LEVEL" counter_reset
+      append_metric counter_reset
+      continue
+    fi
+
+    if [ "$warmup" -gt 0 ]; then
+      warmup=$(( warmup - 1 ))
+      pressure=0; calm=0; stable=0
+      write_state "$CURRENT_LEVEL" learning_baseline
+      append_metric learning_baseline
+      continue
+    fi
+
+    if [ "$cooldown" -gt 0 ]; then
+      pressure=0; calm=0; stable=0
+      write_state "$CURRENT_LEVEL" cooldown_hold
+      append_metric cooldown_hold
       continue
     fi
 
     reason=steady
-    if [ "$CURRENT_DROPS" -gt 0 ] || [ "$CURRENT_SQUEEZE" -gt 0 ] || [ "$CURRENT_SOFTIRQ" -ge "$SOFTIRQ_HIGH" ]; then
+    if [ "$CURRENT_STEAL" -ge "$STEAL_HIGH" ]; then
+      pressure=0; calm=0; stable=0
+      reason=host_steal_pressure
+    elif [ "$CURRENT_PRESSURE_SCORE" -ge 3 ]; then
       pressure=$(( pressure + 1 )); calm=0; stable=0
       reason=pressure_detected
+    elif [ "$d_udp_effective" -gt 0 ] || [ "$d_listen" -gt 0 ]; then
+      pressure=0; calm=0; stable=0
+      reason=application_socket_pressure
+    elif [ "$d_qdisc" -gt 0 ]; then
+      pressure=0; calm=0; stable=0
+      reason=egress_queue_pressure
+    elif [ "$CURRENT_RETRANS_BP" -ge 50 ]; then
+      pressure=0; calm=0; stable=0
+      reason=external_path_loss
     elif [ "$CURRENT_SOFTIRQ" -le "$SOFTIRQ_LOW" ]; then
       calm=$(( calm + 1 )); pressure=0; stable=$(( stable + 1 ))
       reason=latency_headroom
@@ -1856,12 +2657,20 @@ controller_loop() {
       pressure=0; calm=0; stable=$(( stable + 1 ))
     fi
 
-    if [ "$pressure" -ge "$UP_WINDOWS" ] && [ "$CURRENT_LEVEL" -lt 2 ]; then
-      apply_level $(( CURRENT_LEVEL + 1 )) drop_or_softirq_pressure
-      pressure=0; stable=0
-    elif [ "$calm" -ge "$DOWN_WINDOWS" ] && [ "$CURRENT_LEVEL" -gt 0 ]; then
-      apply_level $(( CURRENT_LEVEL - 1 )) lower_queue_latency
-      calm=0; stable=0
+    if [ "$cooldown" -eq 0 ] && [ "$pressure" -ge "$UP_WINDOWS" ] && [ "$CURRENT_LEVEL" -lt 2 ]; then
+      cooldown="$COOLDOWN_WINDOWS"
+      if apply_level $(( CURRENT_LEVEL + 1 )) drop_or_softirq_pressure; then
+        pressure=0; stable=0
+      else
+        reason=actuator_rollback; pressure=0; stable=0
+      fi
+    elif [ "$cooldown" -eq 0 ] && [ "$calm" -ge "$DOWN_WINDOWS" ] && [ "$CURRENT_LEVEL" -gt 0 ]; then
+      cooldown="$COOLDOWN_WINDOWS"
+      if apply_level $(( CURRENT_LEVEL - 1 )) lower_queue_latency; then
+        calm=0; stable=0
+      else
+        reason=actuator_rollback; calm=0; stable=0
+      fi
     else
       write_state "$CURRENT_LEVEL" "$reason"
     fi
@@ -1891,7 +2700,7 @@ build_auto_service() {
 [Unit]
 Description=Live Relay Adaptive Network Controller
 Wants=network-online.target
-After=network-online.target live-relay-nic-tuning.service
+After=network-online.target live-relay-sysctl.service live-relay-nic-tuning.service
 
 [Service]
 Type=simple
@@ -1899,7 +2708,7 @@ EnvironmentFile=-$AUTO_ENV_FILE
 ExecStart=$AUTO_HELPER loop
 Restart=always
 RestartSec=2
-Nice=0
+Nice=10
 LimitNOFILE=1048576
 TasksMax=infinity
 
@@ -1909,22 +2718,40 @@ EOF_AUTOSERVICE
 }
 
 write_auto_env() {
-  local nic="$1" data_plane cpus softirq_high softirq_low
+  local nic="$1" data_plane cpus physical mem_gb numa rxqs driver speed softirq_high softirq_low
   data_plane=$(detect_data_plane)
   cpus=$(online_cpu_count)
-  softirq_high=$(( 70 / cpus ))
-  softirq_low=$(( 35 / cpus ))
-  [ "$softirq_high" -lt 5 ] && softirq_high=5
-  [ "$softirq_low" -lt 2 ] && softirq_low=2
+  physical=$(physical_core_count)
+  case "$physical" in ''|*[!0-9]*|0) physical="$cpus" ;; esac
+  mem_gb=$(mem_total_gb)
+  numa=$(numa_node_count)
+  rxqs=$(nic_rx_queue_count "$nic")
+  driver=$(nic_driver_name "$nic")
+  speed=$(nic_speed_mbps "$nic")
+  # The controller compares these thresholds with the busiest CPU share.  Do
+  # not divide them by CPU count; that would classify idle multicore hosts as
+  # permanently saturated.
+  softirq_high=70
+  softirq_low=35
   cat > "$AUTO_ENV_FILE" <<EOF_AUTOENV
 DEV=$nic
 WORKDIR=$WORKDIR
 DATA_PLANE=$data_plane
+ONLINE_CPUS=$cpus
+PHYSICAL_CORES=$physical
+MEMORY_GB=$mem_gb
+NUMA_NODES=$numa
+RX_QUEUE_COUNT=$rxqs
+NIC_DRIVER=${driver:-unknown}
+NIC_SPEED_MBPS=${speed:-0}
 AUTO_INTERVAL=${AUTO_INTERVAL:-10}
 AUTO_UP_WINDOWS=${AUTO_UP_WINDOWS:-3}
-AUTO_DOWN_WINDOWS=${AUTO_DOWN_WINDOWS:-6}
+AUTO_DOWN_WINDOWS=${AUTO_DOWN_WINDOWS:-12}
+AUTO_COOLDOWN_WINDOWS=${AUTO_COOLDOWN_WINDOWS:-6}
+AUTO_WARMUP_WINDOWS=${AUTO_WARMUP_WINDOWS:-3}
 SOFTIRQ_HIGH=${SOFTIRQ_HIGH:-$softirq_high}
 SOFTIRQ_LOW=${SOFTIRQ_LOW:-$softirq_low}
+STEAL_HIGH=${STEAL_HIGH:-5}
 EOF_AUTOENV
 }
 
@@ -2155,22 +2982,19 @@ show_status() {
     ' || true
 
     echo "IRQ 分布:"
-    awk -v dev="$nic" '
-      $0 ~ dev {
-        irq=$1
-        sub(":", "", irq)
-        sum=0
-        for (i=2; i<=NF; i++) {
-          if ($i ~ /^[0-9]+$/) sum += $i
-          else break
-        }
-        printf "  IRQ %-4s 总中断=%-12s 设备=%s\n", irq, sum, $NF
-        found=1
-      }
-      END {
-        if (!found) print "  未找到相关 IRQ"
-      }
-    ' /proc/interrupts || true
+    {
+      found_irq=0
+      while read -r irq; do
+        [ -n "$irq" ] || continue
+        found_irq=1
+        awk -v wanted="${irq}:" '$1 == wanted {
+          sum=0
+          for (i=2; i<=NF; i++) {if ($i ~ /^[0-9]+$/) sum += $i; else break}
+          printf "  IRQ %-4s 总中断=%-12s 设备=%s\n", wanted, sum, $NF
+        }' /proc/interrupts
+      done < <(collect_nic_irqs "$nic" | awk '!seen[$0]++' | sort -n)
+      [ "$found_irq" -eq 1 ] || echo "  未找到相关 IRQ"
+    } || true
 
     echo "IRQ 亲和性:"
     {
@@ -2183,18 +3007,22 @@ show_status() {
         else
           printf '  IRQ %-4s CPU=%s\n' "$irq" "unknown"
         fi
-      done < <(awk -v dev="$nic" '$0 ~ dev {gsub(":", "", $1); print $1}' /proc/interrupts)
+      done < <(collect_nic_irqs "$nic" | awk '!seen[$0]++' | sort -n)
       [ "$found_irq" -eq 1 ] || echo "  未找到相关 IRQ"
     } || true
 
     if command -v tc >/dev/null 2>&1; then
       echo "qdisc:"
       tc qdisc show dev "$nic" 2>/dev/null | sed 's/^/  /' || true
-      printf '%-22s %s\n' "leaf fq 统计:" "$(
+      printf '%-22s %s\n' "qdisc 拓扑:" "$(
         tc qdisc show dev "$nic" 2>/dev/null | awk '
-          / parent / {total++}
-          / parent / && / fq / {fq++}
-          END {printf "%d/%d", fq+0, total+0}
+          / root / {root=$2}
+          / parent / {leaf++}
+          / parent / && $2 == "fq" {fq++}
+          END {
+            if (leaf > 0) printf "mq leaves fq=%d/%d", fq+0, leaf+0
+            else printf "root %s / single-queue", (root == "" ? "unknown" : root)
+          }
         '
       )"
     fi
@@ -2215,7 +3043,11 @@ show_status() {
 }
 
 show_auto_status() {
-  local service_status="未安装" level="-" reason="-" pps="0" softirq="0" drops="0" updated="-"
+  local service_status="未安装" level="-" reason="-" pps="0" rx_bps="0" tx_bps="0"
+  local softirq="0" steal="0" drops="0" updated="-" udp_rx="0" udp_tx="0"
+  local retrans="0" retrans_bp="0" listen_drops="0" qdisc_drops="0" score="0"
+  local machine="-" active_backlog="0" active_budget="0" active_usecs="0"
+  local sys_applied="-" sys_normalized="-" sys_skipped="-" sys_failed="-"
   local data_plane="$(detect_data_plane)" nic="$(default_nic)" pause_status="运行中"
   if [ -f "$AUTO_ENV_FILE" ]; then
     # shellcheck disable=SC1090
@@ -2226,12 +3058,21 @@ show_auto_status() {
   if [ -f "$AUTO_STATE_FILE" ]; then
     # shellcheck disable=SC1090
     source "$AUTO_STATE_FILE" || true
-    level="${LEVEL:-$level}"
-    reason="${REASON:-$reason}"
-    pps="${PPS:-$pps}"
-    softirq="${SOFTIRQ_PCT:-$softirq}"
-    drops="${DROP_DELTA:-$drops}"
-    updated="${UPDATED_AT:-$updated}"
+    level="${LEVEL:-$level}"; reason="${REASON:-$reason}"; pps="${PPS:-$pps}"
+    rx_bps="${RX_BPS:-$rx_bps}"; tx_bps="${TX_BPS:-$tx_bps}"
+    softirq="${SOFTIRQ_PCT:-$softirq}"; steal="${STEAL_PCT:-$steal}"
+    drops="${DROP_DELTA:-$drops}"; udp_rx="${UDP_RCVBUF_DELTA:-$udp_rx}"; udp_tx="${UDP_SNDBUF_DELTA:-$udp_tx}"
+    retrans="${TCP_RETRANS_DELTA:-$retrans}"; retrans_bp="${TCP_RETRANS_BP:-$retrans_bp}"
+    listen_drops="${LISTEN_DROP_DELTA:-$listen_drops}"; qdisc_drops="${QDISC_DROP_DELTA:-$qdisc_drops}"
+    score="${PRESSURE_SCORE:-$score}"; machine="${MACHINE:-$machine}"
+    active_backlog="${ACTIVE_BACKLOG:-$active_backlog}"; active_budget="${ACTIVE_BUDGET:-$active_budget}"
+    active_usecs="${ACTIVE_BUDGET_USECS:-$active_usecs}"; updated="${UPDATED_AT:-$updated}"
+  fi
+  if [ -f "$SYSCTL_STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$SYSCTL_STATE_FILE" || true
+    sys_applied="${SYSCTL_APPLIED:-$sys_applied}"; sys_normalized="${SYSCTL_NORMALIZED:-$sys_normalized}"
+    sys_skipped="${SYSCTL_SKIPPED:-$sys_skipped}"; sys_failed="${SYSCTL_FAILED:-$sys_failed}"
   fi
   [ -e "$PAUSE_FILE" ] && pause_status="已暂停"
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet live-relay-auto-controller.service 2>/dev/null; then
@@ -2248,39 +3089,69 @@ show_auto_status() {
   case "$reason" in
     controller_started) reason="控制器启动" ;;
     calibrated_balanced) reason="校准完成" ;;
-    pressure_detected) reason="检测到丢包或软中断压力" ;;
-    drop_or_softirq_pressure) reason="压力持续，自动升档" ;;
+    pressure_detected) reason="检测到本机数据面压力" ;;
+    drop_or_softirq_pressure) reason="本机压力持续，自动升档" ;;
     lower_queue_latency) reason="余量充足，自动降低排队" ;;
     latency_headroom) reason="延迟余量充足" ;;
+    learning_baseline) reason="正在学习流量基线" ;;
+    cooldown_hold) reason="冷却观察中，暂不重复调参" ;;
+    host_steal_pressure) reason="宿主机 Steal 偏高，冻结调参" ;;
+    application_socket_pressure) reason="应用 Socket 缓冲或监听压力" ;;
+    egress_queue_pressure) reason="本机出口队列出现丢包" ;;
+    external_path_loss) reason="检测到外部路径重传" ;;
+    actuator_rollback) reason="参数校验失败，已自动回滚" ;;
+    actuator_unsupported) reason="内核不支持动态参数，保持当前配置" ;;
+    metrics_unavailable) reason="监控指标暂不可用，暂停调参" ;;
+    counter_reset) reason="检测到计数器重置，跳过本窗口" ;;
     user_paused) reason="用户暂停" ;;
     stable_rollback) reason="已回退稳定版" ;;
     steady) reason="运行稳定" ;;
   esac
 
   echo
-  echo "================ 自适应状态 ================"
+  echo "================ V4 自适应状态 ================"
   printf '%-20s %s\n' "控制器:" "$service_status / $pause_status"
   printf '%-20s %s\n' "数据面:" "$data_plane"
   printf '%-20s %s\n' "网卡:" "${nic:-unknown}"
+  printf '%-20s %s\n' "硬件模型:" "$machine"
   printf '%-20s %s\n' "当前档位:" "$level"
   printf '%-20s %s\n' "调优原因:" "$reason"
   printf '%-20s %s\n' "当前 PPS:" "$pps"
-  printf '%-20s %s%%\n' "SoftIRQ:" "$softirq"
+  printf '%-20s %s / %s\n' "RX/TX bps:" "$rx_bps" "$tx_bps"
+  printf '%-20s %s%% / %s%%\n' "最忙核 SoftIRQ/Steal:" "$softirq" "$steal"
   printf '%-20s %s\n' "窗口丢包增量:" "$drops"
+  printf '%-20s %s / %s\n' "UDP 缓冲错误:" "$udp_rx" "$udp_tx"
+  printf '%-20s %s / %s bp\n' "TCP 重传:" "$retrans" "$retrans_bp"
+  printf '%-20s %s / %s\n' "监听/qdisc丢包:" "$listen_drops" "$qdisc_drops"
+  printf '%-20s %s\n' "本机压力分:" "$score"
+  printf '%-20s %s / %s / %sus\n' "backlog/budget:" "$active_backlog" "$active_budget" "$active_usecs"
+  printf '%-20s %s/%s/%s/%s\n' "sysctl A/N/S/F:" "$sys_applied" "$sys_normalized" "$sys_skipped" "$sys_failed"
   printf '%-20s %s\n' "更新时间:" "$updated"
-  echo "============================================"
+  echo "================================================"
   echo
 }
 
 redetect_environment() {
-  local nic
+  local nic old_nic=""
   nic=$(select_nic_noninteractive || true)
   [ -n "$nic" ] || { err "未检测到可用网卡。"; return 1; }
   if command -v systemctl >/dev/null 2>&1; then
     systemctl stop live-relay-auto-controller.service >/dev/null 2>&1 || true
   fi
-  write_auto_env "$nic"
+  if [ -f "$SNAPSHOT_DIR/runtime.env" ]; then
+    # A NIC switch must not reuse the previous device's restoration snapshot.
+    # Restore the old device first, then capture a clean baseline for the new one.
+    # shellcheck disable=SC1090
+    source "$SNAPSHOT_DIR/runtime.env" || true
+    old_nic="${ORIGINAL_NIC:-}"
+    if [ -n "$old_nic" ] && [ "$old_nic" != "$nic" ]; then
+      restore_original_runtime
+      rm -rf "$SNAPSHOT_DIR"
+    fi
+  fi
+  capture_original_runtime "$nic"
   setup_mode2_persistence "$nic"
+  write_auto_env "$nic"
   build_auto_controller
   if command -v systemctl >/dev/null 2>&1; then
     systemctl start live-relay-auto-controller.service >/dev/null 2>&1 || true
@@ -2391,7 +3262,7 @@ while IFS= read -r line || [ -n "\$line" ]; do
   value="\${line#*=}"
   key="\$(printf '%s' "\$key" | tr -d '[:space:]')"
   value="\$(printf '%s' "\$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*\$//')"
-  path="/proc/sys/\${key//./\/}"
+  path="/proc/sys/\${key//.//}"
   [ -e "\$path" ] && sysctl -q -w "\$key=\$value" >/dev/null 2>&1 || true
 done < "$HIA_SYSCTL_FILE"
 DEV="\$(ip -o route show to default 2>/dev/null | awk '{print \$5; exit}')"
