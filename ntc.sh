@@ -122,6 +122,15 @@ sysctl_proc_path() {
   echo "/proc/sys/${1//.//}"
 }
 
+# Some vendor/physical-host kernels expose netdev_budget_usecs but reject
+# writes to it, retaining the kernel-selected value. Treat that as a
+# capability difference rather than a failed tuning transaction.
+is_kernel_retained_sysctl() {
+  local key="$1" actual="${2:-}"
+  [ "$key" = "net.core.netdev_budget_usecs" ] || return 1
+  [[ "$actual" =~ ^[0-9]+$ ]]
+}
+
 append_if_supported() {
   local key="$1" value="$2" path
   path=$(sysctl_proc_path "$key")
@@ -703,14 +712,25 @@ apply_sysctl_file() {
       continue
     fi
     if ! sysctl -w "$key=$value" >>"$SYSCTL_LOG" 2>&1; then
-      printf 'FAILED %s requested=%s reason=write-error\n' "$key" "$value" >> "$SYSCTL_LOG"
-      failed=$(( failed + 1 ))
+      actual=$(sysctl -n "$key" 2>/dev/null | awk '{$1=$1; print}' || true)
+      if is_kernel_retained_sysctl "$key" "$actual"; then
+        printf 'SKIPPED %s requested=%s actual=%s reason=kernel-rejected-retained\n' \
+          "$key" "$value" "$actual" >> "$SYSCTL_LOG"
+        skipped=$(( skipped + 1 ))
+      else
+        printf 'FAILED %s requested=%s reason=write-error\n' "$key" "$value" >> "$SYSCTL_LOG"
+        failed=$(( failed + 1 ))
+      fi
       continue
     fi
     expected=$(printf '%s\n' "$value" | awk '{$1=$1; print}')
     actual=$(sysctl -n "$key" 2>/dev/null | awk '{$1=$1; print}' || true)
     if [ "$actual" = "$expected" ]; then
       applied=$(( applied + 1 ))
+    elif is_kernel_retained_sysctl "$key" "$actual"; then
+      printf 'SKIPPED %s requested=%s actual=%s reason=kernel-retained-value\n' \
+        "$key" "$expected" "$actual" >> "$SYSCTL_LOG"
+      skipped=$(( skipped + 1 ))
     elif [ "$key" = "net.netfilter.nf_conntrack_buckets" ] && \
          [[ "$expected" =~ ^[0-9]+$ ]] && [[ "$actual" =~ ^[0-9]+$ ]] && [ "$actual" -gt 0 ]; then
       printf 'NORMALIZED %s requested=%s actual=%s reason=kernel-hash-alignment\n' "$key" "$expected" "$actual" >> "$SYSCTL_LOG"
@@ -752,7 +772,8 @@ set -u
 SYSCTL_FILE="$SYSCTL_FILE"
 [ -r "\$SYSCTL_FILE" ] || exit 0
 
-failed=0
+  failed=0
+  actual=""
 while IFS= read -r line || [ -n "\$line" ]; do
   case "\$line" in
     ''|'#'*) continue ;;
@@ -763,7 +784,13 @@ while IFS= read -r line || [ -n "\$line" ]; do
   value="\$(printf '%s' "\$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*\$//')"
   path="/proc/sys/\${key//.//}"
   [ -e "\$path" ] && [ -w "\$path" ] || continue
-  sysctl -q -w "\$key=\$value" >/dev/null 2>&1 || failed=1
+  if ! sysctl -q -w "\$key=\$value" >/dev/null 2>&1; then
+    actual="\$(sysctl -n "\$key" 2>/dev/null | awk '{\$1=\$1; print}' || true)"
+    if [ "\$key" = "net.core.netdev_budget_usecs" ] && [[ "\$actual" =~ ^[0-9]+\$ ]]; then
+      continue
+    fi
+    failed=1
+  fi
 done < "\$SYSCTL_FILE"
 exit "\$failed"
 EOF_SYSCTL_HELPER
@@ -2037,6 +2064,11 @@ NUMA_COUNT="${NUMA_NODES:-1}"
 RX_QUEUES="${RX_QUEUE_COUNT:-1}"
 NIC_DRIVER_NAME="${NIC_DRIVER:-unknown}"
 NIC_HELPER="/usr/local/sbin/live-relay-nic-apply.sh"
+is_kernel_retained_sysctl() {
+  local key="$1" actual="${2:-}"
+  [ "$key" = "net.core.netdev_budget_usecs" ] || return 1
+  [[ "$actual" =~ ^[0-9]+$ ]]
+}
 case "$INTERVAL" in ''|*[!0-9]*|0) INTERVAL=10 ;; esac
 case "$UP_WINDOWS" in ''|*[!0-9]*|0) UP_WINDOWS=3 ;; esac
 case "$DOWN_WINDOWS" in ''|*[!0-9]*|0) DOWN_WINDOWS=12 ;; esac
@@ -2282,6 +2314,12 @@ apply_parameter_group() {
     [ -n "$old" ] || continue
     old_values[$i]="$old"
     if ! sysctl -q -w "$key=$value" >/dev/null 2>&1; then
+      actual=$(sysctl -n "$key" 2>/dev/null | awk '{$1=$1; print}' || true)
+      if is_kernel_retained_sysctl "$key" "$actual"; then
+        # The kernel owns this value on some physical-host kernels. Keep the
+        # retained value and continue the actuator transaction.
+        continue
+      fi
       for ((j = ${#applied_indices[@]} - 1; j >= 0; j--)); do
         i="${applied_indices[$j]}"
         sysctl -q -w "${keys[$i]}=${old_values[$i]}" >/dev/null 2>&1 || true
@@ -2289,7 +2327,7 @@ apply_parameter_group() {
       return 1
     fi
     actual=$(sysctl -n "$key" 2>/dev/null | awk '{$1=$1; print}' || true)
-    if [ "$actual" != "$value" ]; then
+    if [ "$actual" != "$value" ] && ! is_kernel_retained_sysctl "$key" "$actual"; then
       sysctl -q -w "$key=$old" >/dev/null 2>&1 || true
       for ((j = ${#applied_indices[@]} - 1; j >= 0; j--)); do
         i="${applied_indices[$j]}"
