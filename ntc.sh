@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="4.0.0-autonomous-relay"
+VERSION="4.1.0-aggressive-auto"
 WORKDIR="/opt/live-relay-tuner"
 NIC_ENV_FILE="/etc/live-relay-nic.env"
 NIC_HELPER="/usr/local/sbin/live-relay-nic-apply.sh"
@@ -21,7 +21,6 @@ HIA_HELPER="/usr/local/sbin/hia-baseline-apply.sh"
 HIA_SERVICE="/etc/systemd/system/hia-baseline.service"
 STATE_FILE="$WORKDIR/state.env"
 AUTO_STATE_FILE="$WORKDIR/auto-state.env"
-STABLE_STATE_FILE="$WORKDIR/stable-state.env"
 SYSCTL_STATE_FILE="$WORKDIR/sysctl-state.env"
 PAUSE_FILE="$WORKDIR/paused"
 SNAPSHOT_DIR="$WORKDIR/original"
@@ -227,6 +226,20 @@ calc_socket_buffer_max() {
   fi
 }
 
+calc_socket_buffer_default() {
+  local mem_gb
+  mem_gb=$(mem_total_gb)
+  if [ "$mem_gb" -ge 64 ]; then
+    echo 6291456
+  elif [ "$mem_gb" -ge 16 ]; then
+    echo 4194304
+  elif [ "$mem_gb" -ge 4 ]; then
+    echo 1048576
+  else
+    echo 524288
+  fi
+}
+
 current_cc_algo() {
   sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo cubic
 }
@@ -317,9 +330,6 @@ calc_conntrack_max() {
     multiplier="${CONNTRACK_MULTIPLIER}"
   else
     case "$mode" in
-      stable)
-        if [ "$mem_gb" -ge 64 ]; then multiplier=3; else multiplier=2; fi
-        ;;
       hyper|auto|*)
         if [ "$mem_gb" -ge 256 ]; then multiplier=4
         elif [ "$mem_gb" -ge 64 ]; then multiplier=3
@@ -382,7 +392,7 @@ calc_flow_limit_enabled() {
 calc_netdev_backlog() {
   local speed="$1" cpus="$2" base cap
   case "$speed" in
-    ''|*[!0-9]*) base=32768 ;;
+    ''|*[!0-9]*) base=65536 ;;
     *)
       if [ "$speed" -ge 100000 ]; then
         base=65536
@@ -507,6 +517,53 @@ calc_somaxconn() {
   fi
 }
 
+calc_tcp_max_tw_buckets() {
+  local mem_gb cpus override mem_target cpu_target target floor
+  override="${TCP_MAX_TW_BUCKETS:-}"
+  case "$override" in
+    ''|*[!0-9]*) ;;
+    *)
+      [ "$override" -ge 32768 ] || override=32768
+      [ "$override" -le 1048576 ] || override=1048576
+      echo "$override"
+      return 0
+      ;;
+  esac
+
+  mem_gb=$(mem_total_gb)
+  cpus=$(online_cpu_count)
+  case "$cpus" in ''|*[!0-9]*) cpus=1 ;; esac
+  # Budget roughly 12K TIME_WAIT entries per GB and 16K per online CPU, then
+  # use the tighter side.  This yields 16K-granular tiers without letting a
+  # high core count outrun the host's memory budget.
+  mem_target=$(( mem_gb * 12288 ))
+  cpu_target=$(( cpus * 16384 ))
+  if [ "$mem_target" -lt "$cpu_target" ]; then
+    target="$mem_target"
+  else
+    target="$cpu_target"
+  fi
+
+  if [ "$mem_gb" -ge 4 ] || [ "$cpus" -ge 4 ]; then
+    floor=65536
+  else
+    floor=32768
+  fi
+  [ "$target" -ge "$floor" ] || target="$floor"
+  [ "$target" -le 1048576 ] || target=1048576
+  target=$(( (target + 16383) / 16384 * 16384 ))
+  [ "$target" -le 1048576 ] || target=1048576
+  echo "$target"
+}
+
+calc_tcp_notsent_lowat() {
+  local value="${TCP_NOTSENT_LOWAT:-131072}"
+  case "$value" in ''|*[!0-9]*) value=131072 ;; esac
+  [ "$value" -ge 16384 ] || value=16384
+  [ "$value" -le 524288 ] || value=524288
+  echo "$value"
+}
+
 calc_flow_limit_table_len() {
   local cpus
   cpus=$(online_cpu_count)
@@ -537,14 +594,16 @@ detect_primary_speed() {
 }
 
 append_common_sysctls() {
-  local cc="$1"
+  local cc="$1" lowat
+  lowat=$(calc_tcp_notsent_lowat)
   append_if_supported net.core.default_qdisc fq
   append_if_supported net.ipv4.tcp_congestion_control "$cc"
 
   append_if_supported net.ipv4.tcp_mtu_probing 1
   append_if_supported net.ipv4.tcp_slow_start_after_idle 0
   append_if_supported net.ipv4.tcp_limit_output_bytes 1048576
-  append_if_supported net.ipv4.tcp_notsent_lowat 131072
+  append_if_supported net.ipv4.tcp_notsent_lowat "$lowat"
+  append_if_supported net.ipv4.tcp_fastopen 3
   append_if_supported net.ipv4.ip_local_port_range "10000 65535"
 
   append_if_supported net.ipv4.tcp_fin_timeout 10
@@ -564,32 +623,8 @@ append_common_sysctls() {
   append_if_supported vm.overcommit_memory 1
 }
 
-append_stable_sysctls() {
-  append_if_supported net.core.somaxconn 32768
-  append_if_supported net.ipv4.tcp_max_syn_backlog 32768
-  append_if_supported net.core.netdev_max_backlog 32768
-  append_if_supported net.core.netdev_budget 300
-  append_if_supported net.core.netdev_budget_usecs 4000
-  append_if_supported net.core.dev_weight 128
-
-  append_if_supported fs.file-max 2097152
-
-  append_if_supported net.core.rmem_max 67108864
-  append_if_supported net.core.wmem_max 67108864
-  append_if_supported net.core.rmem_default 1048576
-  append_if_supported net.core.wmem_default 262144
-  append_if_supported net.core.optmem_max 262144
-
-  append_if_supported net.ipv4.tcp_rmem "4096 262144 67108864"
-  append_if_supported net.ipv4.tcp_wmem "4096 65536 67108864"
-  append_if_supported net.ipv4.udp_rmem_min 131072
-
-  append_if_supported vm.dirty_background_bytes 67108864
-  append_if_supported vm.dirty_bytes 268435456
-}
-
 append_hyper_sysctls() {
-  local speed cpus somax backlog budget budget_usecs filemax flow_table_len udp_mem mem_gb socket_max
+  local speed cpus somax backlog budget budget_usecs filemax flow_table_len udp_mem mem_gb socket_max socket_default tw_buckets
   speed=$(detect_primary_speed)
   cpus=$(online_cpu_count)
   somax=$(calc_somaxconn)
@@ -601,13 +636,21 @@ append_hyper_sysctls() {
   udp_mem=$(calc_udp_mem_pages)
   mem_gb=$(mem_total_gb)
   socket_max=$(calc_socket_buffer_max)
+  socket_default=$(calc_socket_buffer_default)
+  tw_buckets=$(calc_tcp_max_tw_buckets)
 
   append_if_supported net.core.somaxconn "$somax"
+  # Keep SYN backlog coupled to the machine-sized listen queue; do not force
+  # 262144 on small hosts where the extra SYN_RECV memory is counterproductive.
   append_if_supported net.ipv4.tcp_max_syn_backlog "$somax"
+  case "${ENABLE_TCP_TW_REUSE:-1}" in
+    1|on|yes|true) append_if_supported net.ipv4.tcp_tw_reuse 1 ;;
+  esac
+  append_if_supported net.ipv4.tcp_max_tw_buckets "$tw_buckets"
   append_if_supported net.core.netdev_max_backlog "$backlog"
   append_if_supported net.core.netdev_budget "$budget"
   append_if_supported net.core.netdev_budget_usecs "$budget_usecs"
-  append_if_supported net.core.dev_weight 128
+  append_if_supported net.core.dev_weight 768
   append_if_supported net.core.dev_weight_rx_bias 1
   append_if_supported net.core.dev_weight_tx_bias 1
   append_if_supported net.core.flow_limit_table_len "$flow_table_len"
@@ -616,17 +659,16 @@ append_hyper_sysctls() {
 
   append_if_supported net.core.rmem_max "$socket_max"
   append_if_supported net.core.wmem_max "$socket_max"
-  append_if_supported net.core.rmem_default 262144
-  append_if_supported net.core.wmem_default 262144
+  append_if_supported net.core.rmem_default "$socket_default"
+  append_if_supported net.core.wmem_default "$socket_default"
   append_if_supported net.core.optmem_max 262144
 
-  append_if_supported net.ipv4.tcp_rmem "4096 262144 $socket_max"
-  append_if_supported net.ipv4.tcp_wmem "4096 131072 $socket_max"
+  append_if_supported net.ipv4.tcp_rmem "4096 $socket_default $socket_max"
+  append_if_supported net.ipv4.tcp_wmem "4096 $socket_default $socket_max"
   append_if_supported net.ipv4.udp_mem "$udp_mem"
-  append_if_supported net.ipv4.udp_rmem_min 262144
+  append_if_supported net.ipv4.udp_rmem_min "$socket_default"
 
   append_if_supported net.ipv4.tcp_limit_output_bytes 524288
-  append_if_supported net.ipv4.tcp_notsent_lowat 65536
 
   if [ "$mem_gb" -ge 128 ]; then
     append_if_supported vm.dirty_background_bytes 268435456
@@ -656,11 +698,7 @@ append_conntrack_sysctls() {
   append_if_supported net.netfilter.nf_conntrack_buckets "$buckets"
   append_if_supported net.netfilter.nf_conntrack_max "$ct_max"
 
-  if [ "$mode" = "stable" ]; then
-    est=7200
-  else
-    est=1800
-  fi
+  est=1800
 
   append_if_supported net.netfilter.nf_conntrack_tcp_timeout_established "$est"
   append_if_supported net.netfilter.nf_conntrack_tcp_timeout_syn_recv 20
@@ -672,14 +710,6 @@ append_conntrack_sysctls() {
   append_if_supported net.netfilter.nf_conntrack_tcp_timeout_close 10
   append_if_supported net.netfilter.nf_conntrack_udp_timeout 15
   append_if_supported net.netfilter.nf_conntrack_udp_timeout_stream 120
-}
-
-write_profile_1() {
-  local cc="$1"
-  begin_sysctl_file "稳定高容量模式"
-  append_common_sysctls "$cc"
-  append_stable_sysctls
-  append_conntrack_sysctls stable
 }
 
 write_profile_2() {
@@ -1222,11 +1252,7 @@ _calc_auto_queue_base() {
   [ "$worker_primary" -gt 0 ] || worker_primary="${#WORKER_CPUS[@]}"
 
   if _is_virtual_driver "$driver"; then
-    if [ "$worker_primary" -ge 8 ]; then
-      target_q=$(( worker_primary / 2 ))
-    else
-      target_q="$worker_primary"
-    fi
+    target_q="$worker_primary"
     [ "$target_q" -gt 32 ] && target_q=32
   else
     case "$speed" in
@@ -1337,7 +1363,7 @@ _apply_queue_count() {
 
 _apply_max_rings() {
   local rxmax txmax cur target_rx target_tx mode
-  mode="${RING_MODE:-balanced}"
+  mode="${RING_MODE:-throughput}"
   if [ "${MAX_RINGS:-0}" = "1" ]; then
     mode="throughput"
   fi
@@ -1408,7 +1434,7 @@ _apply_coalesce() {
     return 0
   }
 
-  if [ "${COALESCE_MODE:-balanced}" = "adaptive" ]; then
+  if [ "${COALESCE_MODE:-latency}" = "adaptive" ]; then
     ethtool -C "$DEV" adaptive-rx on adaptive-tx on >/dev/null 2>&1 || true
   else
     ethtool -C "$DEV" adaptive-rx off adaptive-tx off >/dev/null 2>&1 || true
@@ -1440,7 +1466,7 @@ _apply_coalesce() {
       ;;
   esac
 
-  case "${COALESCE_MODE:-balanced}" in
+  case "${COALESCE_MODE:-latency}" in
     latency) rx=2; tx=2 ;;
     throughput) rx=12; tx=12 ;;
   esac
@@ -1874,8 +1900,8 @@ USE_HT=${USE_HT:-0}
 WORKER_CPUS_TARGET=${WORKER_CPUS_TARGET:-local}
 TARGET_QUEUES=${TARGET_QUEUES:-auto}
 MAX_RINGS=${MAX_RINGS:-0}
-RING_MODE=${RING_MODE:-balanced}
-COALESCE_MODE=${COALESCE_MODE:-balanced}
+RING_MODE=${RING_MODE:-throughput}
+COALESCE_MODE=${COALESCE_MODE:-latency}
 RFS_FLOW_ENTRIES=${RFS_FLOW_ENTRIES:-auto}
 ENABLE_RPS=${ENABLE_RPS:-auto}
 RPS_FORWARD_ONLY=${RPS_FORWARD_ONLY:-1}
@@ -2043,7 +2069,6 @@ WORKDIR="${WORKDIR:-/opt/live-relay-tuner}"
 PROC_ROOT="${PROC_ROOT:-/proc}"
 SYS_ROOT="${SYS_ROOT:-/sys}"
 STATE_FILE="$WORKDIR/auto-state.env"
-STABLE_FILE="$WORKDIR/stable-state.env"
 PAUSE_FILE="$WORKDIR/paused"
 METRICS_LOG="$WORKDIR/metrics.log"
 LOCK_DIR="$WORKDIR/controller.lock"
@@ -2051,7 +2076,6 @@ CPU_PREV_FILE="$WORKDIR/cpu-window.prev"
 CPU_NOW_FILE="$WORKDIR/cpu-window.now"
 INTERVAL="${AUTO_INTERVAL:-10}"
 UP_WINDOWS="${AUTO_UP_WINDOWS:-3}"
-DOWN_WINDOWS="${AUTO_DOWN_WINDOWS:-12}"
 COOLDOWN_WINDOWS="${AUTO_COOLDOWN_WINDOWS:-6}"
 WARMUP_WINDOWS="${AUTO_WARMUP_WINDOWS:-3}"
 SOFTIRQ_HIGH="${SOFTIRQ_HIGH:-70}"
@@ -2069,9 +2093,17 @@ is_kernel_retained_sysctl() {
   [ "$key" = "net.core.netdev_budget_usecs" ] || return 1
   [[ "$actual" =~ ^[0-9]+$ ]]
 }
+
+apply_coalesce_level() {
+  local usecs="${ACTIVE_COALESCE:-2}"
+  case "$usecs" in ''|*[!0-9]*) usecs=2 ;; esac
+  command -v ethtool >/dev/null 2>&1 || return 0
+  [ -n "${DEV:-}" ] || return 0
+  ethtool -C "$DEV" adaptive-rx off adaptive-tx off \
+    rx-usecs "$usecs" tx-usecs "$usecs" >/dev/null 2>&1 || true
+}
 case "$INTERVAL" in ''|*[!0-9]*|0) INTERVAL=10 ;; esac
 case "$UP_WINDOWS" in ''|*[!0-9]*|0) UP_WINDOWS=3 ;; esac
-case "$DOWN_WINDOWS" in ''|*[!0-9]*|0) DOWN_WINDOWS=12 ;; esac
 case "$COOLDOWN_WINDOWS" in ''|*[!0-9]*) COOLDOWN_WINDOWS=6 ;; esac
 case "$WARMUP_WINDOWS" in ''|*[!0-9]*) WARMUP_WINDOWS=3 ;; esac
 case "$SOFTIRQ_HIGH" in ''|*[!0-9]*) SOFTIRQ_HIGH=70 ;; esac
@@ -2364,24 +2396,12 @@ write_state() {
     printf 'ACTIVE_BACKLOG=%q\n' "${ACTIVE_BACKLOG:-0}"
     printf 'ACTIVE_BUDGET=%q\n' "${ACTIVE_BUDGET:-0}"
     printf 'ACTIVE_BUDGET_USECS=%q\n' "${ACTIVE_BUDGET_USECS:-0}"
+    printf 'ACTIVE_WEIGHT=%q\n' "${ACTIVE_WEIGHT:-0}"
+    printf 'ACTIVE_COALESCE=%q\n' "${ACTIVE_COALESCE:-0}"
     printf 'COOLDOWN_REMAINING=%q\n' "${cooldown:-0}"
     printf 'UPDATED_AT=%q\n' "$(date +%F_%T)"
   } > "$tmp"
   mv -f "$tmp" "$STATE_FILE"
-}
-
-write_stable() {
-  local level="$1" tmp="$STABLE_FILE.tmp.$$"
-  {
-    printf 'LEVEL=%q\n' "$level"
-    printf 'STABLE_BACKLOG=%q\n' "${ACTIVE_BACKLOG:-0}"
-    printf 'STABLE_BUDGET=%q\n' "${ACTIVE_BUDGET:-0}"
-    printf 'STABLE_BUDGET_USECS=%q\n' "${ACTIVE_BUDGET_USECS:-0}"
-    printf 'STABLE_WEIGHT=%q\n' "${ACTIVE_WEIGHT:-0}"
-    printf 'STABLE_MACHINE=%q\n' "${CPU_COUNT}c/${PHYSICAL_COUNT}p/${MEM_GB}G/${NUMA_COUNT}n/${RX_QUEUES}q/${NIC_DRIVER_NAME}"
-    printf 'SAVED_AT=%q\n' "$(date +%F_%T)"
-  } > "$tmp"
-  mv -f "$tmp" "$STABLE_FILE"
 }
 
 append_metric() {
@@ -2406,100 +2426,71 @@ clamp_value() {
 }
 
 calculate_level_parameters() {
-  local level="$1" data_cpus memory_cap pps pps_per horizon slice candidate
+  local level="$1" data_cpus memory_cap pps pps_per candidate backlog_floor
+  local budget_floor=900 budget_max=2048
   pps="${CURRENT_PPS:-0}"
   case "$pps" in ''|*[!0-9]*) pps=0 ;; esac
   data_cpus="$PHYSICAL_COUNT"
   [ "$RX_QUEUES" -lt "$data_cpus" ] && data_cpus="$RX_QUEUES"
   [ "$data_cpus" -gt 0 ] || data_cpus=1
   pps_per=$(( pps / data_cpus ))
-  memory_cap=$(( MEM_GB * 1073741824 / 50 / data_cpus / 2048 ))
-  memory_cap=$(clamp_value "$memory_cap" 32768 131072)
 
-  case "$level" in
-    0)
-      horizon=4000; slice=250
-      candidate=$(( pps_per * horizon / 1000000 ))
-      ACTIVE_BACKLOG=$(clamp_value "$candidate" 8192 "$memory_cap")
-      candidate=$(( pps_per * slice / 1000000 ))
-      ACTIVE_BUDGET=$(clamp_value "$candidate" 300 600)
-      ACTIVE_BUDGET_USECS=1500
-      [ "$pps_per" -ge 150000 ] && ACTIVE_BUDGET_USECS=2000
-      [ "$pps_per" -ge 400000 ] && ACTIVE_BUDGET_USECS=2500
-      ACTIVE_WEIGHT=64; ACTIVE_COALESCE=2
-      ACTIVE_BUDGET=$(clamp_value "$ACTIVE_BUDGET" 300 600)
-      ACTIVE_BUDGET_USECS=$(clamp_value "$ACTIVE_BUDGET_USECS" 1500 3000)
-      ;;
-    2)
-      horizon=32000; slice=1000
-      candidate=$(( pps_per * horizon / 1000000 ))
-      ACTIVE_BACKLOG=$(clamp_value "$candidate" 32768 "$memory_cap")
-      candidate=$(( pps_per * slice / 1000000 ))
-      ACTIVE_BUDGET=$(clamp_value "$candidate" 900 1800)
-      ACTIVE_BUDGET_USECS=4000
-      [ "$pps_per" -ge 150000 ] && ACTIVE_BUDGET_USECS=5000
-      [ "$pps_per" -ge 400000 ] && ACTIVE_BUDGET_USECS=6000
-      [ "$pps_per" -ge 800000 ] && ACTIVE_BUDGET_USECS=7000
-      ACTIVE_WEIGHT=256
-      if [ "$pps" -ge 200000 ]; then ACTIVE_COALESCE=12; else ACTIVE_COALESCE=8; fi
-      ACTIVE_BUDGET_USECS=$(clamp_value "$ACTIVE_BUDGET_USECS" 4000 8000)
-      ;;
-    *)
-      horizon=12000; slice=500
-      candidate=$(( pps_per * horizon / 1000000 ))
-      ACTIVE_BACKLOG=$(clamp_value "$candidate" 16384 "$memory_cap")
-      candidate=$(( pps_per * slice / 1000000 ))
-      ACTIVE_BUDGET=$(clamp_value "$candidate" 600 1100)
-      ACTIVE_BUDGET_USECS=2500
-      [ "$pps_per" -ge 150000 ] && ACTIVE_BUDGET_USECS=3000
-      [ "$pps_per" -ge 400000 ] && ACTIVE_BUDGET_USECS=3500
-      ACTIVE_WEIGHT=128; ACTIVE_COALESCE=6
-      ACTIVE_BUDGET=$(clamp_value "$ACTIVE_BUDGET" 600 1100)
-      ACTIVE_BUDGET_USECS=$(clamp_value "$ACTIVE_BUDGET_USECS" 2500 4500)
-      ;;
-  esac
+  # Keep every machine in the high-performance envelope.  The floor is
+  # deliberately derived from memory/CPU size, so a zero-traffic calibration
+  # cannot collapse the data plane to the old conservative level-1 values.
+  if [ "$MEM_GB" -ge 64 ] && [ "$data_cpus" -ge 16 ]; then
+    backlog_floor=196608
+  elif [ "$MEM_GB" -ge 4 ] && [ "$data_cpus" -ge 4 ]; then
+    backlog_floor=131072
+  else
+    backlog_floor=65536
+  fi
+  memory_cap=$(( MEM_GB * 1073741824 / 50 / data_cpus / 2048 ))
+  memory_cap=$(clamp_value "$memory_cap" "$backlog_floor" 262144)
+
+  candidate=$(( pps_per * 32000 / 1000000 ))
+  ACTIVE_BACKLOG=$(clamp_value "$candidate" "$backlog_floor" "$memory_cap")
+  candidate=$(( pps_per * 1000 / 1000000 ))
+  ACTIVE_BUDGET=$(clamp_value "$candidate" "$budget_floor" "$budget_max")
+
+  # 1200 us is the aggressive target on kernels that accept the knob.  Some
+  # physical-host kernels retain their own value (for example 12000 us), so
+  # the remaining packet/weight controls carry the performance profile there.
+  ACTIVE_BUDGET_USECS=1200
+  [ "$pps_per" -ge 150000 ] && ACTIVE_BUDGET_USECS=1600
+  [ "$pps_per" -ge 400000 ] && ACTIVE_BUDGET_USECS=2200
+  [ "$pps_per" -ge 800000 ] && ACTIVE_BUDGET_USECS=3000
+  ACTIVE_BUDGET_USECS=$(clamp_value "$ACTIVE_BUDGET_USECS" 1200 4000)
+
+  ACTIVE_WEIGHT=768
+  [ "$pps" -ge 200000 ] && ACTIVE_WEIGHT=1024
+  [ "$pps" -ge 800000 ] && ACTIVE_WEIGHT=1536
+
+  ACTIVE_COALESCE=2
+  [ "$pps" -ge 200000 ] && ACTIVE_COALESCE=8
+  [ "$pps" -ge 800000 ] && ACTIVE_COALESCE=12
+  return 0
 }
 
 apply_level() {
   local level="$1" reason="${2:-automatic}"
-  case "$level" in 0|1|2) : ;; *) level=1 ;; esac
+  # There is one user-facing performance profile.  Keep the level field at 2
+  # for compatibility with existing state files while removing weak downshifts.
+  level=2
   calculate_level_parameters "$level"
 
   if ! apply_parameter_group; then
     write_state "${CURRENT_LEVEL:-$level}" actuator_rollback
     return 1
   fi
-  # Coalescing is set once by the NIC calibration helper.  Keep it out of the
-  # short control loop: a driver may silently clamp or reject ethtool writes,
-  # and changing it without read-back would break the actuator transaction.
+  apply_coalesce_level
   write_state "$level" "$reason"
   CURRENT_LEVEL="$level"
 }
 
-apply_stable() {
-  local level=1 machine="${CPU_COUNT}c/${PHYSICAL_COUNT}p/${MEM_GB}G/${NUMA_COUNT}n/${RX_QUEUES}q/${NIC_DRIVER_NAME}"
-  if [ -f "$STABLE_FILE" ]; then
-    source "$STABLE_FILE"
-    level="${LEVEL:-1}"
-  fi
-  if [ "${STABLE_MACHINE:-}" = "$machine" ] && \
-     [[ "${STABLE_BACKLOG:-}" =~ ^[0-9]+$ ]] && [[ "${STABLE_BUDGET:-}" =~ ^[0-9]+$ ]] && \
-     [[ "${STABLE_BUDGET_USECS:-}" =~ ^[0-9]+$ ]] && [[ "${STABLE_WEIGHT:-}" =~ ^[0-9]+$ ]]; then
-    ACTIVE_BACKLOG="$STABLE_BACKLOG"; ACTIVE_BUDGET="$STABLE_BUDGET"
-    ACTIVE_BUDGET_USECS="$STABLE_BUDGET_USECS"; ACTIVE_WEIGHT="$STABLE_WEIGHT"
-    if apply_parameter_group; then
-      CURRENT_LEVEL="$level"
-      write_state "$level" stable_rollback
-      return 0
-    fi
-  fi
-  apply_level "$level" stable_rollback
-}
-
 calibrate() {
   [ -x "$NIC_HELPER" ] && "$NIC_HELPER" >/dev/null 2>&1 || true
-  apply_level 1 calibrated_balanced || return 1
-  write_stable 1
+  apply_level 2 aggressive_calibrated || return 1
 }
 
 controller_loop() {
@@ -2509,7 +2500,7 @@ controller_loop() {
   local now_udp_in now_udp_rcv now_udp_snd now_retrans now_outsegs now_listen now_qdisc
   local elapsed d_total d_soft d_steal d_rx d_tx d_rx_bytes d_tx_bytes d_soft_drop d_squeeze d_driver
   local d_udp_in d_udp_rcv d_udp_snd d_udp_effective d_retrans d_outsegs d_listen d_qdisc
-  local pressure=0 calm=0 stable=0 cooldown=0 warmup="$WARMUP_WINDOWS" reason
+  local pressure=0 cooldown=0 warmup="$WARMUP_WINDOWS" reason
   local counter_reset=0 metric_invalid=0 cpu_sample_valid=0 path
   prev_rx=0; prev_tx=0; prev_rx_bytes=0; prev_tx_bytes=0
   prev_soft_drop=0; prev_squeeze=0; prev_driver=0; prev_total=0; prev_soft=0; prev_steal=0
@@ -2518,9 +2509,9 @@ controller_loop() {
   now_rx=0; now_tx=0; now_rx_bytes=0; now_tx_bytes=0
   now_soft_drop=0; now_squeeze=0; now_driver=0; now_total=0; now_soft=0; now_steal=0; now_ts=0
   now_udp_in=0; now_udp_rcv=0; now_udp_snd=0; now_retrans=0; now_outsegs=0; now_listen=0; now_qdisc=0
-  CURRENT_LEVEL=1
+  CURRENT_LEVEL=2
   [ -f "$STATE_FILE" ] && source "$STATE_FILE" 2>/dev/null || true
-  CURRENT_LEVEL="${LEVEL:-1}"
+  CURRENT_LEVEL=2
   cooldown="${COOLDOWN_REMAINING:-0}"
   case "$cooldown" in ''|*[!0-9]*) cooldown=0 ;; esac
   [ "$cooldown" -gt "$COOLDOWN_WINDOWS" ] && cooldown="$COOLDOWN_WINDOWS"
@@ -2639,19 +2630,19 @@ controller_loop() {
 
     if [ -e "$PAUSE_FILE" ]; then
       write_state "$CURRENT_LEVEL" user_paused paused
-      pressure=0; calm=0; stable=0
+      pressure=0
       continue
     fi
 
     if [ "$metric_invalid" -ne 0 ]; then
-      pressure=0; calm=0; stable=0; warmup="$WARMUP_WINDOWS"
+      pressure=0; warmup="$WARMUP_WINDOWS"
       write_state "$CURRENT_LEVEL" metrics_unavailable
       append_metric metrics_unavailable
       continue
     fi
 
     if [ "$counter_reset" -ne 0 ]; then
-      pressure=0; calm=0; stable=0; warmup="$WARMUP_WINDOWS"
+      pressure=0; warmup="$WARMUP_WINDOWS"
       write_state "$CURRENT_LEVEL" counter_reset
       append_metric counter_reset
       continue
@@ -2659,14 +2650,14 @@ controller_loop() {
 
     if [ "$warmup" -gt 0 ]; then
       warmup=$(( warmup - 1 ))
-      pressure=0; calm=0; stable=0
+      pressure=0
       write_state "$CURRENT_LEVEL" learning_baseline
       append_metric learning_baseline
       continue
     fi
 
     if [ "$cooldown" -gt 0 ]; then
-      pressure=0; calm=0; stable=0
+      pressure=0
       write_state "$CURRENT_LEVEL" cooldown_hold
       append_metric cooldown_hold
       continue
@@ -2674,48 +2665,37 @@ controller_loop() {
 
     reason=steady
     if [ "$CURRENT_STEAL" -ge "$STEAL_HIGH" ]; then
-      pressure=0; calm=0; stable=0
+      pressure=0
       reason=host_steal_pressure
     elif [ "$CURRENT_PRESSURE_SCORE" -ge 3 ]; then
-      pressure=$(( pressure + 1 )); calm=0; stable=0
+      pressure=$(( pressure + 1 ))
       reason=pressure_detected
     elif [ "$d_udp_effective" -gt 0 ] || [ "$d_listen" -gt 0 ]; then
-      pressure=0; calm=0; stable=0
+      pressure=0
       reason=application_socket_pressure
     elif [ "$d_qdisc" -gt 0 ]; then
-      pressure=0; calm=0; stable=0
+      pressure=0
       reason=egress_queue_pressure
     elif [ "$CURRENT_RETRANS_BP" -ge 50 ]; then
-      pressure=0; calm=0; stable=0
+      pressure=0
       reason=external_path_loss
     elif [ "$CURRENT_SOFTIRQ" -le "$SOFTIRQ_LOW" ]; then
-      calm=$(( calm + 1 )); pressure=0; stable=$(( stable + 1 ))
-      reason=latency_headroom
+      pressure=0
+      reason=aggressive_hold
     else
-      pressure=0; calm=0; stable=$(( stable + 1 ))
+      pressure=0
+      reason=aggressive_hold
     fi
 
-    if [ "$cooldown" -eq 0 ] && [ "$pressure" -ge "$UP_WINDOWS" ] && [ "$CURRENT_LEVEL" -lt 2 ]; then
+    if [ "$cooldown" -eq 0 ] && [ "$pressure" -ge "$UP_WINDOWS" ]; then
       cooldown="$COOLDOWN_WINDOWS"
-      if apply_level $(( CURRENT_LEVEL + 1 )) drop_or_softirq_pressure; then
-        pressure=0; stable=0
+      if apply_level 2 drop_or_softirq_pressure; then
+        pressure=0
       else
-        reason=actuator_rollback; pressure=0; stable=0
-      fi
-    elif [ "$cooldown" -eq 0 ] && [ "$calm" -ge "$DOWN_WINDOWS" ] && [ "$CURRENT_LEVEL" -gt 0 ]; then
-      cooldown="$COOLDOWN_WINDOWS"
-      if apply_level $(( CURRENT_LEVEL - 1 )) lower_queue_latency; then
-        calm=0; stable=0
-      else
-        reason=actuator_rollback; calm=0; stable=0
+        reason=actuator_rollback; pressure=0
       fi
     else
       write_state "$CURRENT_LEVEL" "$reason"
-    fi
-
-    if [ "$stable" -ge "$DOWN_WINDOWS" ]; then
-      write_stable "$CURRENT_LEVEL"
-      stable=0
     fi
     append_metric "$reason"
   done
@@ -2724,10 +2704,9 @@ controller_loop() {
 case "${1:-loop}" in
   loop) acquire_lock && controller_loop ;;
   calibrate) acquire_lock && calibrate ;;
-  apply-stable) acquire_lock && apply_stable ;;
-  level-0|level-1|level-2) acquire_lock && apply_level "${1#level-}" manual ;;
+  level-2) acquire_lock && apply_level 2 manual ;;
   status) [ -f "$STATE_FILE" ] && cat "$STATE_FILE" ;;
-  *) echo "usage: $0 {loop|calibrate|apply-stable|level-0|level-1|level-2|status}"; exit 2 ;;
+  *) echo "usage: $0 {loop|calibrate|level-2|status}"; exit 2 ;;
 esac
 EOF_AUTO
   chmod +x "$AUTO_HELPER"
@@ -2784,7 +2763,6 @@ NIC_DRIVER=${driver:-unknown}
 NIC_SPEED_MBPS=${speed:-0}
 AUTO_INTERVAL=${AUTO_INTERVAL:-10}
 AUTO_UP_WINDOWS=${AUTO_UP_WINDOWS:-3}
-AUTO_DOWN_WINDOWS=${AUTO_DOWN_WINDOWS:-12}
 AUTO_COOLDOWN_WINDOWS=${AUTO_COOLDOWN_WINDOWS:-6}
 AUTO_WARMUP_WINDOWS=${AUTO_WARMUP_WINDOWS:-3}
 SOFTIRQ_HIGH=${SOFTIRQ_HIGH:-$softirq_high}
@@ -2835,10 +2813,6 @@ apply_profile() {
 
   write_limits
   case "$mode" in
-    1)
-      write_profile_1 "$cc"
-      remove_mode2_service
-      ;;
     2)
       write_profile_2 "$cc"
       ;;
@@ -2925,6 +2899,9 @@ show_status() {
   printf '%-22s %s\n' "rps_sock_flow_entries:" "$(cat /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || echo 0)"
   printf '%-22s %s\n' "tcp_limit_output:" "$(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null || true)"
   printf '%-22s %s\n' "tcp_notsent_lowat:" "$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null || true)"
+  printf '%-22s %s\n' "tcp_tw_reuse:" "$(sysctl -n net.ipv4.tcp_tw_reuse 2>/dev/null || echo n/a)"
+  printf '%-22s %s\n' "tcp_max_tw_buckets:" "$(sysctl -n net.ipv4.tcp_max_tw_buckets 2>/dev/null || echo n/a)"
+  printf '%-22s %s\n' "tcp_fastopen:" "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo n/a)"
   printf '%-22s %s\n' "conntrack_count:" "$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo n/a)"
   printf '%-22s %s\n' "conntrack_max:" "$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo n/a)"
   printf '%-22s %s\n' "模式2 CPU策略:" "$worker_target"
@@ -3084,7 +3061,7 @@ show_auto_status() {
   local service_status="未安装" level="-" reason="-" pps="0" rx_bps="0" tx_bps="0"
   local softirq="0" steal="0" drops="0" updated="-" udp_rx="0" udp_tx="0"
   local retrans="0" retrans_bp="0" listen_drops="0" qdisc_drops="0" score="0"
-  local machine="-" active_backlog="0" active_budget="0" active_usecs="0"
+  local machine="-" active_backlog="0" active_budget="0" active_usecs="0" active_weight="0" active_coalesce="0"
   local sys_applied="-" sys_normalized="-" sys_skipped="-" sys_failed="-"
   local data_plane="$(detect_data_plane)" nic="$(default_nic)" pause_status="运行中"
   if [ -f "$AUTO_ENV_FILE" ]; then
@@ -3104,7 +3081,8 @@ show_auto_status() {
     listen_drops="${LISTEN_DROP_DELTA:-$listen_drops}"; qdisc_drops="${QDISC_DROP_DELTA:-$qdisc_drops}"
     score="${PRESSURE_SCORE:-$score}"; machine="${MACHINE:-$machine}"
     active_backlog="${ACTIVE_BACKLOG:-$active_backlog}"; active_budget="${ACTIVE_BUDGET:-$active_budget}"
-    active_usecs="${ACTIVE_BUDGET_USECS:-$active_usecs}"; updated="${UPDATED_AT:-$updated}"
+    active_usecs="${ACTIVE_BUDGET_USECS:-$active_usecs}"; active_weight="${ACTIVE_WEIGHT:-$active_weight}"
+    active_coalesce="${ACTIVE_COALESCE:-$active_coalesce}"; updated="${UPDATED_AT:-$updated}"
   fi
   if [ -f "$SYSCTL_STATE_FILE" ]; then
     # shellcheck disable=SC1090
@@ -3119,18 +3097,13 @@ show_auto_status() {
     service_status="inactive"
   fi
 
-  case "$level" in
-    0) level="0 / 低延迟" ;;
-    1) level="1 / 平衡" ;;
-    2) level="2 / 抗压" ;;
-  esac
+  level="暴力自动加速"
   case "$reason" in
     controller_started) reason="控制器启动" ;;
-    calibrated_balanced) reason="校准完成" ;;
+    aggressive_calibrated) reason="暴力基线已校准" ;;
     pressure_detected) reason="检测到本机数据面压力" ;;
     drop_or_softirq_pressure) reason="本机压力持续，自动升档" ;;
-    lower_queue_latency) reason="余量充足，自动降低排队" ;;
-    latency_headroom) reason="延迟余量充足" ;;
+    aggressive_hold) reason="高性能基线保持" ;;
     learning_baseline) reason="正在学习流量基线" ;;
     cooldown_hold) reason="冷却观察中，暂不重复调参" ;;
     host_steal_pressure) reason="宿主机 Steal 偏高，冻结调参" ;;
@@ -3142,12 +3115,11 @@ show_auto_status() {
     metrics_unavailable) reason="监控指标暂不可用，暂停调参" ;;
     counter_reset) reason="检测到计数器重置，跳过本窗口" ;;
     user_paused) reason="用户暂停" ;;
-    stable_rollback) reason="已回退稳定版" ;;
     steady) reason="运行稳定" ;;
   esac
 
   echo
-  echo "================ V4 自适应状态 ================"
+  echo "============== V4.1 暴力自适应状态 =============="
   printf '%-20s %s\n' "控制器:" "$service_status / $pause_status"
   printf '%-20s %s\n' "数据面:" "$data_plane"
   printf '%-20s %s\n' "网卡:" "${nic:-unknown}"
@@ -3162,7 +3134,7 @@ show_auto_status() {
   printf '%-20s %s / %s bp\n' "TCP 重传:" "$retrans" "$retrans_bp"
   printf '%-20s %s / %s\n' "监听/qdisc丢包:" "$listen_drops" "$qdisc_drops"
   printf '%-20s %s\n' "本机压力分:" "$score"
-  printf '%-20s %s / %s / %sus\n' "backlog/budget:" "$active_backlog" "$active_budget" "$active_usecs"
+  printf '%-20s %s / %s / %sus / weight=%s / coalesce=%sus\n' "暴力参数:" "$active_backlog" "$active_budget" "$active_usecs" "$active_weight" "$active_coalesce"
   printf '%-20s %s/%s/%s/%s\n' "sysctl A/N/S/F:" "$sys_applied" "$sys_normalized" "$sys_skipped" "$sys_failed"
   printf '%-20s %s\n' "更新时间:" "$updated"
   echo "================================================"
@@ -3217,18 +3189,6 @@ toggle_auto_tuning() {
     touch "$PAUSE_FILE"
     log "自动调优已暂停，当前参数保持不变。"
   fi
-}
-
-rollback_stable() {
-  [ -x "$AUTO_HELPER" ] || { err "自动控制器尚未安装。"; return 1; }
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl stop live-relay-auto-controller.service >/dev/null 2>&1 || true
-  fi
-  "$AUTO_HELPER" apply-stable
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl start live-relay-auto-controller.service >/dev/null 2>&1 || true
-  fi
-  log "已恢复上一个稳定配置。"
 }
 
 show_diagnostics() {
@@ -3403,9 +3363,8 @@ show_menu() {
  3) 重新检测
  4) 立即校准
  5) $pause_label
- 6) 回退稳定版
- 7) 高级诊断
- 8) 卸载并回退 HIA
+ 6) 高级诊断
+ 7) 卸载并回退 HIA
  0) 退出
 ========================================================
 EOF_MENU
@@ -3438,19 +3397,14 @@ main() {
       toggle_auto_tuning
       return 0
       ;;
-    6|rollback)
-      rollback_stable
-      return 0
-      ;;
-    7|diag|diagnostics)
+    6|diag|diagnostics)
       show_diagnostics
       return 0
       ;;
-    8|cleanup|remove|hia)
+    7|cleanup|remove|hia)
       cleanup_live_relay
       return 0
       ;;
-    stable) apply_profile 1; return 0 ;;
     hyper) apply_profile 2; return 0 ;;
     "")
       ;;
@@ -3461,7 +3415,7 @@ main() {
 
   while true; do
     show_menu
-    read -r -p "请选择 [0-8]：" choice
+    read -r -p "请选择 [0-7]：" choice
     case "$choice" in
       1)
         install_auto_tuning
@@ -3484,14 +3438,10 @@ main() {
         sleep 1
         ;;
       6)
-        rollback_stable
-        read -r -p "按回车键继续..." _tmp
-        ;;
-      7)
         show_diagnostics
         read -r -p "按回车键继续..." _tmp
         ;;
-      8)
+      7)
         read -r -p "输入 HIA 确认卸载并回退：" _confirm
         [ "$_confirm" = "HIA" ] || { warn "已取消。"; sleep 1; continue; }
         cleanup_live_relay
