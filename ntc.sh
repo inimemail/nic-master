@@ -680,17 +680,60 @@ append_hyper_sysctls() {
 
 }
 
+conntrack_sysctl_path() {
+  printf '%s/sys/net/netfilter/nf_conntrack_max\n' "${PROC_ROOT:-/proc}"
+}
+
+ensure_conntrack_available() {
+  local path pm kernel package
+  path=$(conntrack_sysctl_path)
+  [ -e "$path" ] && return 0
+
+  ensure_cmd modprobe || true
+  if command -v modprobe >/dev/null 2>&1; then
+    modprobe nf_conntrack >/dev/null 2>&1 || true
+  fi
+  if [ -e "$path" ]; then
+    log "conntrack 内核模块已加载。"
+    return 0
+  fi
+
+  if is_container; then
+    warn "容器无法加载宿主机 conntrack 模块，跳过连接跟踪调优。"
+    return 1
+  fi
+
+  pm=$(detect_pm)
+  kernel=$(uname -r)
+  package=""
+  case "$pm" in
+    apt) package="linux-modules-extra-${kernel}" ;;
+    dnf|yum) package="kernel-modules-extra-${kernel}" ;;
+    zypper) package="kernel-default-extra" ;;
+  esac
+
+  if [ -n "$package" ]; then
+    info "conntrack 模块缺失，正在安装 ${package}..."
+    install_packages "$pm" "$package" || true
+    command -v depmod >/dev/null 2>&1 && depmod -a "$kernel" >/dev/null 2>&1 || true
+    command -v modprobe >/dev/null 2>&1 && modprobe nf_conntrack >/dev/null 2>&1 || true
+  fi
+
+  if [ -e "$path" ]; then
+    log "conntrack 内核支持已安装并加载。"
+    return 0
+  fi
+
+  warn "当前内核未提供可加载的 nf_conntrack 模块，连接跟踪调优已跳过。"
+  return 1
+}
+
 append_conntrack_sysctls() {
   local mode="${1:-auto}" buckets ct_max est
   case "${ENABLE_CONNTRACK_TUNING:-auto}" in
     0|off|no|false) return 0 ;;
-    1|on|yes|true) modprobe nf_conntrack >/dev/null 2>&1 || true ;;
-    auto|'') : ;;
+    1|on|yes|true|auto|'') ensure_conntrack_available || return 0 ;;
   esac
-  if [ ! -e /proc/sys/net/netfilter/nf_conntrack_max ]; then
-    log "未使用 conntrack，跳过连接跟踪调优。"
-    return 0
-  fi
 
   buckets=$(calc_conntrack_buckets)
   ct_max=$(calc_conntrack_max "$mode")
@@ -2123,15 +2166,20 @@ release_lock() {
 }
 
 acquire_lock() {
-  local owner=""
+  local owner="" cmdline=""
   if mkdir "$LOCK_DIR" 2>/dev/null; then
     printf '%s\n' "$$" > "$LOCK_DIR/pid"
   else
     [ -r "$LOCK_DIR/pid" ] && owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
     case "$owner" in ''|*[!0-9]*) owner="" ;; esac
     if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
-      echo "控制器正在运行（PID ${owner}），请先停止服务后再执行写操作。" >&2
-      return 1
+      cmdline=$(tr '\0' ' ' < "$PROC_ROOT/$owner/cmdline" 2>/dev/null || true)
+      case "$cmdline" in
+        *live-relay-auto-controller.sh*)
+          echo "控制器正在运行（PID ${owner}）。" >&2
+          return 1
+          ;;
+      esac
     fi
     rm -rf "$LOCK_DIR"
     mkdir "$LOCK_DIR" 2>/dev/null || return 1
@@ -2778,6 +2826,35 @@ remove_hia_baseline() {
   rm -f "$HIA_SERVICE" "$HIA_HELPER" "$HIA_SYSCTL_FILE"
 }
 
+stop_auto_controller_for_reconfigure() {
+  local lock_dir="$WORKDIR/controller.lock" owner cmdline attempts=0
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop live-relay-auto-controller.service >/dev/null 2>&1 || true
+  fi
+
+  if [ -r "$lock_dir/pid" ]; then
+    owner=$(cat "$lock_dir/pid" 2>/dev/null || true)
+    case "$owner" in ''|*[!0-9]*) owner="" ;; esac
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+      cmdline=$(tr '\0' ' ' < "${PROC_ROOT:-/proc}/$owner/cmdline" 2>/dev/null || true)
+      case "$cmdline" in
+        *live-relay-auto-controller.sh*)
+          kill -TERM "$owner" >/dev/null 2>&1 || true
+          while kill -0 "$owner" >/dev/null 2>&1 && [ "$attempts" -lt 30 ]; do
+            sleep 0.1
+            attempts=$(( attempts + 1 ))
+          done
+          kill -KILL "$owner" >/dev/null 2>&1 || true
+          ;;
+        *) log "已清理失效控制器锁（PID ${owner}）。" ;;
+      esac
+    fi
+    rm -rf "$lock_dir"
+  fi
+  rm -f "$WORKDIR/cpu-window.prev" "$WORKDIR/cpu-window.now"
+  return 0
+}
+
 install_auto_tuning() {
   local nic
   ensure_cmd ethtool
@@ -2786,6 +2863,8 @@ install_auto_tuning() {
   ensure_cmd lscpu || true
   nic=$(select_nic_noninteractive || true)
   [ -n "$nic" ] || { err "未检测到可用网卡。"; return 1; }
+  info "正在停止旧控制器并重新应用自动调优..."
+  stop_auto_controller_for_reconfigure || return 1
   remove_hia_baseline
   capture_original_runtime "$nic"
   apply_performance_power_policy
@@ -3357,6 +3436,11 @@ confirm_cleanup() {
   esac
 }
 
+wait_for_main_menu() {
+  local ignored
+  read -r -p "按回车返回主菜单..." ignored || true
+}
+
 show_menu() {
   local status="未安装" data_plane="$(detect_data_plane)" pause_label="暂停调优"
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet live-relay-auto-controller.service 2>/dev/null; then
@@ -3426,24 +3510,23 @@ main() {
 
   while true; do
     show_menu
-    read -r -p "请选择 [0/1/2/3/4]：" choice
+    read -r -p "请选择 [0-4]：" choice
     case "$choice" in
       1)
-        install_auto_tuning
-        break
+        install_auto_tuning || true
+        wait_for_main_menu
         ;;
       2)
-        show_auto_status
-        read -r -p "按回车键继续..." _tmp
+        show_auto_status || true
+        wait_for_main_menu
         ;;
       3)
-        toggle_auto_tuning
-        sleep 1
+        toggle_auto_tuning || true
+        wait_for_main_menu
         ;;
       4)
-        if confirm_cleanup; then
-          break
-        fi
+        confirm_cleanup || true
+        wait_for_main_menu
         ;;
       0)
         exit 0
