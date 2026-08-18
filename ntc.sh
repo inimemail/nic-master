@@ -1919,7 +1919,7 @@ EOF_NICENV
   if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload
     systemctl enable --now live-relay-nic-tuning.service >/dev/null 2>&1 || true
-    log "模式 2 的 VPS/云网卡调优服务已安装并启用。"
+    log "VPS/云网卡调优服务已安装并启用。"
   else
     warn "未找到 systemd，网卡调优已立即生效，但重启后不会持久保留。"
   fi
@@ -2827,7 +2827,7 @@ apply_profile() {
 
   if [ "$mode" = "2" ]; then
     if is_container; then
-      warn "检测到容器环境，模式 2 仅应用 sysctl / limits，跳过 NIC / IRQ / RPS / XPS / qdisc 调优。"
+      warn "检测到容器环境，仅应用 sysctl / limits，跳过 NIC / IRQ / RPS / XPS / qdisc 调优。"
       nic=""
     else
       nic=$(select_nic_noninteractive || true)
@@ -2904,9 +2904,9 @@ show_status() {
   printf '%-22s %s\n' "tcp_fastopen:" "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo n/a)"
   printf '%-22s %s\n' "conntrack_count:" "$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || echo n/a)"
   printf '%-22s %s\n' "conntrack_max:" "$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo n/a)"
-  printf '%-22s %s\n' "模式2 CPU策略:" "$worker_target"
-  printf '%-22s %s\n' "模式2 队列策略:" "$target_queues"
-  printf '%-22s %s\n' "模式2 使用HT:" "$use_ht"
+  printf '%-22s %s\n' "CPU策略:" "$worker_target"
+  printf '%-22s %s\n' "队列策略:" "$target_queues"
+  printf '%-22s %s\n' "使用HT:" "$use_ht"
   printf '%-22s %s\n' "IRQBalance策略:" "$irq_policy"
   if [ "${busy_poll:-0}" -gt 0 ] 2>/dev/null; then
     printf '%-22s %s\n' "Busy Poll:" "开启（${busy_poll} us）"
@@ -3343,6 +3343,20 @@ cleanup_live_relay() {
   fi
 }
 
+confirm_cleanup() {
+  local confirm
+  read -r -p "确认卸载并回退 HIA？[y/N] " confirm
+  case "$confirm" in
+    y|Y)
+      cleanup_live_relay
+      ;;
+    *)
+      warn "已取消卸载。"
+      return 1
+      ;;
+  esac
+}
+
 show_menu() {
   local status="未安装" data_plane="$(detect_data_plane)" pause_label="暂停调优"
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet live-relay-auto-controller.service 2>/dev/null; then
@@ -3360,11 +3374,8 @@ show_menu() {
 --------------------------------------------------------
  1) 自动调优
  2) 运行状态
- 3) 重新检测
- 4) 立即校准
- 5) $pause_label
- 6) 高级诊断
- 7) 卸载并回退 HIA
+ 3) $pause_label
+ 4) 卸载并回退 HIA
  0) 退出
 ========================================================
 EOF_MENU
@@ -3385,25 +3396,25 @@ main() {
       show_auto_status
       return 0
       ;;
-    3|detect)
+    detect)
       redetect_environment
       return 0
       ;;
-    4|calibrate)
+    calibrate)
       calibrate_now
       return 0
       ;;
-    5|pause|resume|toggle)
+    3|5|pause|resume|toggle)
       toggle_auto_tuning
       return 0
       ;;
-    6|diag|diagnostics)
+    diag|diagnostics)
       show_diagnostics
       return 0
       ;;
-    7|cleanup|remove|hia)
-      cleanup_live_relay
-      return 0
+    4|7|cleanup|remove|hia)
+      confirm_cleanup
+      return $?
       ;;
     hyper) apply_profile 2; return 0 ;;
     "")
@@ -3415,7 +3426,7 @@ main() {
 
   while true; do
     show_menu
-    read -r -p "请选择 [0-7]：" choice
+    read -r -p "请选择 [0/1/2/3/4]：" choice
     case "$choice" in
       1)
         install_auto_tuning
@@ -3426,26 +3437,13 @@ main() {
         read -r -p "按回车键继续..." _tmp
         ;;
       3)
-        redetect_environment
-        read -r -p "按回车键继续..." _tmp
-        ;;
-      4)
-        calibrate_now
-        read -r -p "按回车键继续..." _tmp
-        ;;
-      5)
         toggle_auto_tuning
         sleep 1
         ;;
-      6)
-        show_diagnostics
-        read -r -p "按回车键继续..." _tmp
-        ;;
-      7)
-        read -r -p "输入 HIA 确认卸载并回退：" _confirm
-        [ "$_confirm" = "HIA" ] || { warn "已取消。"; sleep 1; continue; }
-        cleanup_live_relay
-        break
+      4)
+        if confirm_cleanup; then
+          break
+        fi
         ;;
       0)
         exit 0
