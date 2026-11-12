@@ -2388,21 +2388,9 @@ data_plane_label() {
   esac
 }
 
-installed_tuner_version() {
-  local value=""
-  if [ -r "$AUTO_ENV_FILE" ]; then
-    value=$(awk -F= '$1=="TUNER_VERSION" {print $2;exit}' "$AUTO_ENV_FILE")
-    if [[ "$value" =~ ^[0-9][A-Za-z0-9_.-]*$ ]]; then printf 'V%s\n' "${value%%-*}"; return 0; fi
-  fi
-  if [ -r "$AUTO_HELPER" ]; then
-    if grep -q '^DETAIL_FILE=' "$AUTO_HELPER"; then printf 'V5\n'
-    elif grep -q '^COOLDOWN_WINDOWS=' "$AUTO_HELPER"; then printf 'V4\n'
-    else printf '版本待识别\n'; fi
-  else printf '版本待识别\n'; fi
-}
 
 tuner_status_label() {
-  local active=0 installed=0 previous="" version
+  local active=0 installed=0 previous=""
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet live-relay-auto-controller.service >/dev/null 2>&1; then active=1; fi
   [ ! -x "$AUTO_HELPER" ] || installed=1
   if [ -r "$WORKDIR/last-operation.env" ]; then
@@ -2410,15 +2398,8 @@ tuner_status_label() {
   fi
   if [ "$previous" = recovery_failed ] || [ -e "$WORKDIR/sysctl-boot-pending" ]; then printf '恢复待处理\n'; return; fi
   if [ "$active" = 1 ]; then
-    version=$(installed_tuner_version)
-    if [ -e "$PAUSE_FILE" ]; then printf '已暂停（%s）\n' "$version"
-    elif [ "$previous" = failed_restored ]; then printf '运行中（%s，上次操作未完成）\n' "$version"
-    else printf '运行中（%s）\n' "$version"; fi
-  elif [ "$installed" = 1 ]; then
-    version=$(installed_tuner_version)
-    if [ "$previous" = failed_restored ]; then printf '已停止（%s，上次操作未完成）\n' "$version"
-    elif [ -e "$PAUSE_FILE" ]; then printf '已暂停（%s，服务未运行）\n' "$version"
-    else printf '已停止（%s）\n' "$version"; fi
+    if [ -e "$PAUSE_FILE" ]; then printf '已暂停\n'; else printf '运行中\n'; fi
+  elif [ "$installed" = 1 ]; then printf '已停止\n'
   elif [ "$previous" = failed_restored ]; then printf '安装未完成\n'
   else printf '未安装\n'; fi
 }
@@ -5476,16 +5457,15 @@ wait_for_main_menu() {
 }
 
 show_menu() {
-  local status data_plane pause_label="暂停调优"
+  local status pause_label="暂停调优"
   status=$(tuner_status_label)
-  data_plane=$(data_plane_label "$(detect_data_plane)")
   [ ! -e "$PAUSE_FILE" ] || pause_label="继续调优"
   clear || true
   cat <<EOF_MENU
 ========================================================
  Live Relay 高级自适应调优
 ========================================================
- 状态：$status | 数据面：$data_plane
+ 状态：$status
 --------------------------------------------------------
  1) 自动调优
  2) 运行状态
