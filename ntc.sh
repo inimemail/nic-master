@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="5.0.3-hyphen-sysctl"
+VERSION="5.1.1-collector-review"
 WORKDIR="/opt/live-relay-tuner"
 NIC_ENV_FILE="/etc/live-relay-nic.env"
 NIC_HELPER="/usr/local/sbin/live-relay-nic-apply.sh"
@@ -318,26 +318,78 @@ calc_socket_buffer_default() {
 }
 
 current_cc_algo() {
-  sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo cubic
+  local current
+  if current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) &&
+     [[ "$current" =~ ^[a-zA-Z0-9_]+$ ]] && [ "${#current}" -le 32 ]; then
+    printf '%s\n' "$current"; return 0
+  fi
+  current=
+  if read -r current 2>/dev/null < "${PROC_ROOT:-/proc}/sys/net/ipv4/tcp_congestion_control" &&
+     [[ "$current" =~ ^[a-zA-Z0-9_]+$ ]] && [ "${#current}" -le 32 ]; then
+    printf '%s\n' "$current"; return 0
+  fi
+  return 1
+}
+
+available_cc_algos() {
+  local available source name valid
+  local -a names=()
+  for source in sysctl proc; do
+    available=
+    if [ "$source" = sysctl ]; then
+      available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null) || continue
+    else
+      read -r available 2>/dev/null < "${PROC_ROOT:-/proc}/sys/net/ipv4/tcp_available_congestion_control" || continue
+    fi
+    available="${available//$'\n'/ }"
+    IFS=$' \t\n' read -r -a names <<< "$available"
+    [ "${#names[@]}" -gt 0 ] || continue
+    valid=1
+    for name in "${names[@]}"; do
+      [[ "$name" =~ ^[a-zA-Z0-9_]+$ ]] && [ "${#name}" -le 32 ] || valid=0
+    done
+    if [ "$valid" = 1 ]; then printf '%s\n' "${names[*]}"; return 0; fi
+  done
+  return 1
 }
 
 pick_cc_algo() {
-  local available current
-  current=$(current_cc_algo)
-  available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
-  if echo " $available " | grep -q ' bbr '; then
+  local available current requested="${TCP_CC:-auto}"
+  current=$(current_cc_algo) || { err "无法读取当前 TCP 拥塞算法，已停止本次配置，避免猜测并覆盖现有算法。" >&2; return 1; }
+  available=" $(available_cc_algos || true) "
+  case "$requested" in
+    keep) printf '%s\n' "$current"; return 0 ;;
+    auto)
+      # Custom BBR builds may use distinct names or still be named bbr.
+      # Keep an already selected variant; names do not establish a ranking.
+      case "$current" in
+        bbr|bbr2|bbr3) printf '%s\n' "$current"; return 0 ;;
+      esac ;;
+    *)
+      [[ "$requested" =~ ^[a-zA-Z0-9_]+$ ]] && [ "${#requested}" -le 32 ] || {
+        err "TCP_CC 无效；请使用 auto、keep 或内核拥塞算法名称。" >&2; return 1;
+      }
+      if [[ "$available" != *" $requested "* ]]; then
+        modprobe "tcp_$requested" >/dev/null 2>&1 || true
+        available=" $(available_cc_algos || true) "
+      fi
+      if [[ "$available" == *" $requested "* ]]; then printf '%s\n' "$requested"; return 0; fi
+      warn "拥塞算法 $requested 不可用，保留当前算法：$current" >&2
+      printf '%s\n' "$current"; return 0 ;;
+  esac
+  if [[ "$available" == *' bbr '* ]]; then
     echo bbr
     return 0
   fi
 
   modprobe tcp_bbr >/dev/null 2>&1 || true
-  available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
-  if echo " $available " | grep -q ' bbr '; then
+  available=" $(available_cc_algos || true) "
+  if [[ "$available" == *' bbr '* ]]; then
     echo bbr
     return 0
   fi
 
-  warn "当前内核不支持 BBR，回退到当前拥塞控制算法：$current" >&2
+  warn "未发现可自动选择的 bbr，保留当前算法：$current（其他变体可用 TCP_CC 明确指定）。" >&2
   echo "$current"
 }
 
@@ -2801,7 +2853,7 @@ find_proxies() {
     DIAG_PROXY_STATUS=detected
   fi
   for pid in $PROXY_PIDS; do
-    comm="unknown"; read -r comm < "$PROC_ROOT/$pid/comm" 2>/dev/null || true
+    comm="unknown"; read -r comm 2>/dev/null < "$PROC_ROOT/$pid/comm" || true
     exe=$(readlink "$PROC_ROOT/$pid/exe" 2>/dev/null || true)
     ns=$(readlink "$PROC_ROOT/$pid/ns/net" 2>/dev/null || true)
     if [ -z "$current_ns" ] || [ -z "$ns" ]; then
@@ -3026,8 +3078,46 @@ collect_link() {
     local route output
     route=$(bounded 2 ip -o route show default dev "$DEV" 2>/dev/null || true)
     DIAG_ROUTE_MTU=$(printf '%s\n' "$route" | awk '{for(i=1;i<NF;i++) if($i=="mtu") {print $(i+1); found=1; exit}} END {if(!found) print "not_explicitly_set"}')
-    output=$(bounded 2 ethtool -k "$DEV" 2>/dev/null | awk '/^[[:space:]]*(generic-segmentation-offload|generic-receive-offload|tcp-segmentation-offload|tx-udp-segmentation|rx-udp-gro-forwarding|rx-gro-list):/ {printf "%s%s",(n++?"; ":""),$0}')
+    output=$(bounded 2 ethtool -k "$DEV" 2>/dev/null | awk '/^[[:space:]]*(generic-segmentation-offload|generic-receive-offload|tcp-segmentation-offload|tx-udp-segmentation|rx-udp-gro-forwarding|rx-gro-list|ntuple-filters):/ {printf "%s%s",(n++?"; ":""),$0}')
     DIAG_OFFLOADS="${output:-unavailable}"
+  fi
+}
+
+# Read-only observations. An attached XDP program or an ntuple flag does not
+# establish native-XDP/aRFS support, nor prove application/socket CPU locality.
+collect_acceleration() {
+  local path mask output current available rx=0 tx=0 rps=0 xps=0 rps_valid=1 xps_valid=1
+  DIAG_XDP_STATUS=unavailable
+  DIAG_ARFS_STATUS=unverified_requires_driver_and_flow_steering
+  DIAG_QUEUE_LOCALITY=unverified_requires_rss_irq_and_application_affinity
+  DIAG_CC_CURRENT=unknown; DIAG_CC_AVAILABLE=unknown
+  DIAG_CC_GENERATION=not_identifiable_from_algorithm_name
+  current=; available=
+  if read -r current 2>/dev/null < "$PROC_ROOT/sys/net/ipv4/tcp_congestion_control"; then DIAG_CC_CURRENT="$current"; fi
+  if read -r available 2>/dev/null < "$PROC_ROOT/sys/net/ipv4/tcp_available_congestion_control"; then DIAG_CC_AVAILABLE="$available"; fi
+  DIAG_RX_QUEUES=unknown; DIAG_TX_QUEUES=unknown
+  DIAG_RPS_ACTIVE_QUEUES=unknown; DIAG_XPS_ACTIVE_QUEUES=unknown
+  [[ "$DEV" =~ ^[A-Za-z0-9_.:-]+$ ]] || return 0
+  for path in "$SYS_ROOT/class/net/$DEV/queues"/rx-*; do
+    [ -d "$path" ] || continue
+    rx=$(( rx + 1 )); mask=
+    if read -r mask 2>/dev/null < "$path/rps_cpus" && [[ "$mask" =~ ^[0-9a-fA-F,]+$ ]]; then
+      [ -z "${mask//[0,]/}" ] || rps=$(( rps + 1 ))
+    else rps_valid=0; fi
+  done
+  for path in "$SYS_ROOT/class/net/$DEV/queues"/tx-*; do
+    [ -d "$path" ] || continue
+    tx=$(( tx + 1 )); mask=
+    if read -r mask 2>/dev/null < "$path/xps_cpus" && [[ "$mask" =~ ^[0-9a-fA-F,]+$ ]]; then
+      [ -z "${mask//[0,]/}" ] || xps=$(( xps + 1 ))
+    else xps_valid=0; fi
+  done
+  if [ "$rx" -gt 0 ]; then DIAG_RX_QUEUES="$rx"; [ "$rps_valid" != 1 ] || DIAG_RPS_ACTIVE_QUEUES="$rps"; fi
+  if [ "$tx" -gt 0 ]; then DIAG_TX_QUEUES="$tx"; [ "$xps_valid" != 1 ] || DIAG_XPS_ACTIVE_QUEUES="$xps"; fi
+  output=$(bounded 2 ip -details -oneline link show dev "$DEV" 2>/dev/null) || return 0
+  if [[ "$output" =~ ^[0-9]+:[[:space:]] ]]; then
+    DIAG_XDP_STATUS=not_reported
+    if [[ "$output" =~ (^|[[:space:]])(prog/xdp|xdp|xdpgeneric|xdpdrv|xdpoffload)([[:space:]]|$) ]]; then DIAG_XDP_STATUS=attached_preserved; fi
   fi
 }
 
@@ -3053,7 +3143,7 @@ probe_mtu() {
 write_diagnostics() {
   local temporary="$DIAG_STATE_FILE.tmp.$$" variable
   {
-    for variable in DIAG_DEV DIAG_CONTROLLER_GENERATION DIAG_MONOTONIC_MS DIAG_RTT_US DIAG_RTT_VALID DIAG_FLOW_FINGERPRINT DIAG_UPDATED_MONO DIAG_PROXY_STATUS DIAG_DATA_PLANE DIAG_FORWARD_DELTA DIAG_PROXY_PROCESSES DIAG_PROXY_VERSION_STATUS DIAG_PROXY_NETNS_STATUS DIAG_PROCESS_TRUNCATED DIAG_THREAD_CPU_STATUS DIAG_THREAD_SCOPE DIAG_THREAD_TOP DIAG_THREAD_MAX_CPU_BP DIAG_SOCKET_STATUS DIAG_SOCKET_SCOPE DIAG_SOCKET_COUNT DIAG_PROXY_SOCKET_STATUS DIAG_PROXY_SOCKET_COUNT DIAG_PROXY_RTT_MAX_US DIAG_PROXY_RCVBUF_ALLOC DIAG_PROXY_SNDBUF_ALLOC DIAG_PROXY_SNDBUF_QUEUED DIAG_PROXY_UDP_SOCKET_COUNT DIAG_PROXY_UDP_RCVBUF_ALLOC DIAG_PROXY_UDP_SNDBUF_ALLOC DIAG_PROXY_UDP_SNDBUF_QUEUED DIAG_PROXY_UDP_SOCKET_DROPS DIAG_MEM_AVAILABLE_KB DIAG_UDP_MEM_PAGES DIAG_UDP6_SOCKETS DIAG_MEMORY_PSI DIAG_CPU_PSI DIAG_CONNTRACK_COUNT DIAG_CONNTRACK_MAX DIAG_IPV4_COUNTERS DIAG_IPV6_COUNTERS DIAG_COUNTER_SCOPE DIAG_LINK_MTU DIAG_ROUTE_MTU DIAG_OFFLOADS DIAG_OFFLOAD_SCOPE DIAG_MTU_PROBE_STATUS DIAG_MTU_PROBE_RESULT DIAG_APP_BATCH_STATUS DIAG_APP_PACING_STATUS DIAG_APP_FEC_STATUS DIAG_APP_HEARTBEAT_STATUS; do
+    for variable in DIAG_DEV DIAG_CONTROLLER_GENERATION DIAG_MONOTONIC_MS DIAG_RTT_US DIAG_RTT_VALID DIAG_FLOW_FINGERPRINT DIAG_UPDATED_MONO DIAG_PROXY_STATUS DIAG_DATA_PLANE DIAG_FORWARD_DELTA DIAG_PROXY_PROCESSES DIAG_PROXY_VERSION_STATUS DIAG_PROXY_NETNS_STATUS DIAG_PROCESS_TRUNCATED DIAG_THREAD_CPU_STATUS DIAG_THREAD_SCOPE DIAG_THREAD_TOP DIAG_THREAD_MAX_CPU_BP DIAG_SOCKET_STATUS DIAG_SOCKET_SCOPE DIAG_SOCKET_COUNT DIAG_PROXY_SOCKET_STATUS DIAG_PROXY_SOCKET_COUNT DIAG_PROXY_RTT_MAX_US DIAG_PROXY_RCVBUF_ALLOC DIAG_PROXY_SNDBUF_ALLOC DIAG_PROXY_SNDBUF_QUEUED DIAG_PROXY_UDP_SOCKET_COUNT DIAG_PROXY_UDP_RCVBUF_ALLOC DIAG_PROXY_UDP_SNDBUF_ALLOC DIAG_PROXY_UDP_SNDBUF_QUEUED DIAG_PROXY_UDP_SOCKET_DROPS DIAG_MEM_AVAILABLE_KB DIAG_UDP_MEM_PAGES DIAG_UDP6_SOCKETS DIAG_MEMORY_PSI DIAG_CPU_PSI DIAG_CONNTRACK_COUNT DIAG_CONNTRACK_MAX DIAG_IPV4_COUNTERS DIAG_IPV6_COUNTERS DIAG_COUNTER_SCOPE DIAG_LINK_MTU DIAG_ROUTE_MTU DIAG_OFFLOADS DIAG_OFFLOAD_SCOPE DIAG_MTU_PROBE_STATUS DIAG_MTU_PROBE_RESULT DIAG_APP_BATCH_STATUS DIAG_APP_PACING_STATUS DIAG_APP_FEC_STATUS DIAG_APP_HEARTBEAT_STATUS DIAG_XDP_STATUS DIAG_ARFS_STATUS DIAG_QUEUE_LOCALITY DIAG_RX_QUEUES DIAG_TX_QUEUES DIAG_RPS_ACTIVE_QUEUES DIAG_XPS_ACTIVE_QUEUES DIAG_CC_CURRENT DIAG_CC_AVAILABLE DIAG_CC_GENERATION; do
       printf '%s=%q\n' "$variable" "${!variable:-unknown}"
     done
   } > "$temporary" && mv -f "$temporary" "$DIAG_STATE_FILE"
@@ -3173,6 +3263,7 @@ collect() {
   collect_memory_network
   classify_data_plane
   collect_link
+  collect_acceleration
   # Probes run only through the explicit probe-mtu subcommand.
   DIAG_MTU_PROBE_STATUS=not_requested; DIAG_MTU_PROBE_RESULT=""
   DIAG_APP_BATCH_STATUS=unknown_requires_application_support
@@ -3418,8 +3509,8 @@ LOCK_METHOD=
 LOCK_OWNER_TOKEN=
 JOURNAL_OWNED=0
 CONTROLLER_GENERATION="$$:${RANDOM}:${RANDOM}:$(date +%s)"
-CPU_PREV_FILE="$WORKDIR/cpu-window.prev"
-CPU_NOW_FILE="$WORKDIR/cpu-window.now"
+CPU_PREVIOUS=
+SAMPLE_CPU_VALID=0
 DETAIL_FILE="$WORKDIR/detail-window.env"
 DIAG_HELPER="${DIAG_HELPER:-/usr/local/sbin/live-relay-diagnostics.sh}"
 
@@ -3432,6 +3523,8 @@ uint() {
   printf '%s\n' "$value"
 }
 INTERVAL=$(uint "${AUTO_INTERVAL:-1}" 1 60); [ "$INTERVAL" -gt 0 ] || INTERVAL=1
+METRICS_MAX_BYTES=$(uint "${AUTO_METRICS_MAX_BYTES:-2097152}" 2097152 67108864)
+[ "$METRICS_MAX_BYTES" -ge 65536 ] || METRICS_MAX_BYTES=65536
 DETAIL_INTERVAL=$(uint "${AUTO_DETAIL_INTERVAL:-10}" 10 300); [ "$DETAIL_INTERVAL" -ge "$INTERVAL" ] || DETAIL_INTERVAL="$INTERVAL"
 DIAG_INTERVAL=$(uint "${AUTO_DIAG_INTERVAL:-30}" 30 3600); [ "$DIAG_INTERVAL" -ge "$DETAIL_INTERVAL" ] || DIAG_INTERVAL="$DETAIL_INTERVAL"
 UP_WINDOWS=$(uint "${AUTO_UP_WINDOWS:-3}" 3 60); [ "$UP_WINDOWS" -gt 0 ] || UP_WINDOWS=1
@@ -3470,57 +3563,122 @@ PARAMETER_NAMES=(ACTIVE_BACKLOG ACTIVE_BUDGET ACTIVE_BUDGET_USECS ACTIVE_WEIGHT)
 mkdir -p "$WORKDIR"
 
 monotonic_millis() {
-  local value
-  value=$(awk '{printf "%.0f\n", $1*1000; exit}' "$PROC_ROOT/uptime" 2>/dev/null || true)
-  case "$value" in ''|*[!0-9]*) value=$(( $(date +%s) * 1000 )) ;; esac
-  printf '%s\n' "$value"
-}
-read_counter() {
-  local value
-  if [ -r "$1" ] && read -r value < "$1"; then
-    case "$value" in ''|*[!0-9]*) ;; *) printf '%s\n' "$value"; return 0 ;; esac
+  local value rest seconds fraction
+  if read -r value rest 2>/dev/null < "$PROC_ROOT/uptime" && [[ "$value" =~ ^([0-9]+)([.]([0-9]+))?$ ]]; then
+    seconds="${BASH_REMATCH[1]}"; fraction="${BASH_REMATCH[3]:-0}000"
+    [ "${#seconds}" -le 12 ] || { printf '0\n'; return 1; }
+    printf '%s\n' "$(( 10#$seconds * 1000 + 10#${fraction:0:3} ))"
+  else
+    # Wall time is a different clock domain and must never drive trials/TTLs.
+    printf '0\n'
+    return 1
   fi
-  printf '%s\n' -1
-  return 1
 }
-softnet_totals() {
-  local line c1 c2 c3 rest dropped=0 squeezed=0 count=0
-  [ -r "$PROC_ROOT/net/softnet_stat" ] || { echo '0 0 0'; return; }
-  while read -r line; do
-    read -r c1 c2 c3 rest <<< "$line"
-    case "$c2:$c3" in *[!0-9a-fA-F:]*|:*|*:) echo '0 0 0'; return ;; esac
-    dropped=$(( dropped + 16#$c2 )); squeezed=$(( squeezed + 16#$c3 )); count=$(( count + 1 ))
-  done < "$PROC_ROOT/net/softnet_stat"
-  [ "$count" -gt 0 ] && echo "$dropped $squeezed 1" || echo '0 0 0'
-}
-protocol_counters() {
-  local v6="$PROC_ROOT/net/snmp6" require_v6=0
+# One portable AWK invocation reads procfs, compares per-core CPU snapshots in
+# memory and returns tagged records. No eval/source, temporary CPU files,
+# strtonum(), or assumptions about the order of SNMP header fields.
+collect_metrics() {
+  local require_v6=0
   [ ! -d "$PROC_ROOT/sys/net/ipv6" ] || require_v6=1
-  [ -r "$PROC_ROOT/net/snmp" ] || { echo '0 0 0 0 0 0'; return; }
-  [ -r "$v6" ] || v6=/dev/null
-  awk -v require_v6="$require_v6" '
-    FILENAME == ARGV[1] && ($1 == "Tcp:" || $1 == "Udp:") {
-      kind=$1
-      if ($2 !~ /^[0-9]+$/) { for(i=2;i<=NF;i++) h[kind,i]=$i; next }
-      for(i=2;i<=NF;i++) { k=h[kind,i]; if(k!="") {v[kind,k]=$i; seen[kind,k]=1} }
+  LC_ALL=C awk -v root="$PROC_ROOT" -v require_v6="$require_v6" '
+    function number(s) {return s ~ /^[0-9]+$/}
+    function decimal(s) {return s=="" ? "0" : s}
+    function hex(s,    i,d,n) {
+      if(s=="" || length(s)>13)return -1
+      s=tolower(s);n=0
+      for(i=1;i<=length(s);i++) {
+        d=index("0123456789abcdef",substr(s,i,1))-1
+        if(d<0)return -1
+        n=n*16+d
+      }
+      return n
     }
-    FILENAME == ARGV[2] && $1 ~ /^Udp6/ {v6[$1]=$2; s6[$1]=1}
+    function snmp(path,    line,a,n,i,kind,key,rc) {
+      while((rc=(getline line < path))>0) {
+        n=split(line,a,/[ \t]+/);kind=a[1]
+        if(kind!="Tcp:" && kind!="Udp:")continue
+        if(!number(a[2])) {
+          for(i=2;i<=n;i++)header[kind,i]=a[i]
+          fields[kind]=n;continue
+        }
+        if(n!=fields[kind]){proto_bad=1;continue}
+        for(i=2;i<=n;i++) {
+          key=header[kind,i]
+          if((kind=="Tcp:" && (key=="RetransSegs" || key=="OutSegs")) ||
+             (kind=="Udp:" && (key=="InErrors" || key=="RcvbufErrors" || key=="SndbufErrors"))) {
+            if(number(a[i])){value[kind,key]=a[i];seen[kind,key]=1}
+            else proto_bad=1
+          }
+        }
+      }
+      if(rc<0)proto_bad=1
+      close(path)
+    }
+    # Previous CPU records arrive on stdin, not in a potentially huge argv.
+    NF==6 && $1 ~ /^cpu[0-9]+$/ {
+      if($1 in old_total)old_bad=1
+      old_total[$1]=$2;old_soft[$1]=$3;old_steal[$1]=$4
+      old_hard[$1]=$5;old_idle[$1]=$6;old_count++
+    }
     END {
-      valid=seen["Tcp:","RetransSegs"] && seen["Tcp:","OutSegs"] && seen["Udp:","InErrors"] && seen["Udp:","RcvbufErrors"] && seen["Udp:","SndbufErrors"]
-      if(require_v6 && !(s6["Udp6InErrors"] && s6["Udp6RcvbufErrors"] && s6["Udp6SndbufErrors"])) valid=0
-      printf "%.0f %.0f %.0f %.0f %.0f %d\n", v["Tcp:","RetransSegs"]+0,v["Tcp:","OutSegs"]+0,v["Udp:","InErrors"]+v6["Udp6InErrors"],v["Udp:","RcvbufErrors"]+v6["Udp6RcvbufErrors"],v["Udp:","SndbufErrors"]+v6["Udp6SndbufErrors"],valid
-    }' "$PROC_ROOT/net/snmp" "$v6" 2>/dev/null
-}
-cpu_snapshot() {
-  awk '/^cpu[0-9]+ / {total=0; for(i=2;i<=9 && i<=NF;i++) total+=$i; print $1,total,$8+0,$9+0,$7+0,$5+$6}' "$PROC_ROOT/stat" 2>/dev/null
-}
-cpu_window_pressure() {
-  awk 'NR==FNR {t[$1]=$2;s[$1]=$3;v[$1]=$4;h[$1]=$5;idle[$1]=$6;old++;next}
-    {if(!($1 in t)){bad=1;next} n++;dt=$2-t[$1];ds=$3-s[$1];dv=$4-v[$1];dh=$5-h[$1];di=$6-idle[$1]
-     if(dt<=0||ds<0||dv<0||dh<0||di<0){bad=1;next}
-     soft=int(ds*100/dt);steal=int(dv*100/dt);hard=int(dh*100/dt);busy=int((dt-di)*100/dt)
-     if(soft>ms)ms=soft;if(steal>mv)mv=steal;if(hard>mh)mh=hard;if(busy>mb)mb=busy}
-    END{if(bad||!n||n!=old)print "0 0 0 0 0";else print ms+0,mv+0,mh+0,mb+0,1}' "$1" "$2" 2>/dev/null
+      path=root "/stat"
+      while((rc=(getline line < path))>0) {
+        n=split(line,a,/[ \t]+/)
+        if(a[1]!~/^cpu[0-9]+$/)continue
+        cpu=a[1];total=0
+        if(n<9 || (cpu in current_seen)){cpu_bad=1;continue}
+        current_seen[cpu]=1
+        for(i=2;i<=9;i++){if(!number(a[i]))cpu_bad=1;total+=a[i]}
+        idle=a[5]+a[6];soft=a[8]+0;steal=a[9]+0;hard=a[7]+0
+        # Refuse imprecise floating point totals instead of inventing a delta.
+        if(total>9007199254740991){cpu_bad=1;continue}
+        printf "C %s %.0f %.0f %.0f %.0f %.0f\n",cpu,total,soft,steal,hard,idle
+        count++
+        if(!(cpu in old_total)){cpu_window_bad=1;continue}
+        dt=total-old_total[cpu];ds=soft-old_soft[cpu];dv=steal-old_steal[cpu]
+        dh=hard-old_hard[cpu];di=idle-old_idle[cpu]
+        if(dt<=0 || ds<0 || dv<0 || dh<0 || di<0 || di>dt || ds>dt || dv>dt || dh>dt){cpu_window_bad=1;continue}
+        s=int(ds*100/dt);v=int(dv*100/dt);h=int(dh*100/dt);b=int((dt-di)*100/dt)
+        if(s>ms)ms=s;if(v>mv)mv=v;if(h>mh)mh=h;if(b>mb)mb=b
+      }
+      close(path)
+      print "V",!(rc<0 || cpu_bad || !count)
+      valid=!(rc<0 || cpu_bad || cpu_window_bad || old_bad || !count || count!=old_count)
+      if(valid)print "U",ms+0,mv+0,mh+0,mb+0,1
+      else print "U 0 0 0 0 0"
+
+      path=root "/net/softnet_stat"
+      while((rc=(getline line < path))>0) {
+        n=split(line,a,/[ \t]+/);d=hex(a[2]);s=hex(a[3])
+        if(n<3 || d<0 || s<0)soft_bad=1
+        else {dropped+=d;squeezed+=s;soft_count++}
+      }
+      close(path)
+      valid=!(rc<0 || soft_bad || !soft_count || dropped>9007199254740991 || squeezed>9007199254740991)
+      if(valid)printf "S %.0f %.0f 1\n",dropped,squeezed
+      else print "S 0 0 0"
+
+      snmp(root "/net/snmp")
+      path=root "/net/snmp6"
+      while((rc=(getline line < path))>0) {
+        n=split(line,a,/[ \t]+/)
+        if(a[1] ~ /^Udp6/ && n==2 && number(a[2])){v6[a[1]]=a[2];seen6[a[1]]=1}
+      }
+      close(path)
+      valid=!proto_bad && seen["Tcp:","RetransSegs"] && seen["Tcp:","OutSegs"] && seen["Udp:","InErrors"] && seen["Udp:","RcvbufErrors"] && seen["Udp:","SndbufErrors"]
+      if(require_v6 && (rc<0 || !(seen6["Udp6InErrors"] && seen6["Udp6RcvbufErrors"] && seen6["Udp6SndbufErrors"])))valid=0
+      # %s preserves raw integer strings above 2^53; Bash sums IPv4/IPv6.
+      printf "P %s %s %s %s %s %s %s %s %d\n", \
+        decimal(value["Tcp:","RetransSegs"]),decimal(value["Tcp:","OutSegs"]), \
+        decimal(value["Udp:","InErrors"]),decimal(value["Udp:","RcvbufErrors"]),decimal(value["Udp:","SndbufErrors"]), \
+        decimal(v6["Udp6InErrors"]),decimal(v6["Udp6RcvbufErrors"]),decimal(v6["Udp6SndbufErrors"]),valid
+
+      path=root "/uptime";rc=(getline line < path);close(path)
+      split(line,a,/[ \t]+/)
+      if(rc>0 && a[1] ~ /^[0-9]+([.][0-9]+)?$/ && a[1]*1000<=9007199254740991)printf "T %.0f\n",a[1]*1000
+      else print "T -1"
+      print "END"
+    }' <<< "${1:-${CPU_PREVIOUS:-}}" 2>/dev/null
 }
 bounded() {
   if command -v timeout >/dev/null 2>&1; then timeout -k 1 3 "$@"; else "$@"; fi
@@ -3596,12 +3754,12 @@ read_details() {
   local requested="${1:-0}" driver=0 dvalid=0 did=none drops=0 backlog=0 qvalid=0 policy=unknown qid=none listen=0 lvalid=0
   local driver_stamp qdisc_stamp listen_stamp stamp tmp
   read -r driver dvalid did < <(driver_drops)
-  driver_stamp=$(monotonic_millis)
+  driver_stamp=$(monotonic_millis) || return 1
   read -r drops backlog qvalid policy qid < <(qdisc_stats)
-  qdisc_stamp=$(monotonic_millis)
+  qdisc_stamp=$(monotonic_millis) || return 1
   read -r listen lvalid < <(listen_drops)
-  listen_stamp=$(monotonic_millis)
-  stamp=$(monotonic_millis)
+  listen_stamp=$(monotonic_millis) || return 1
+  stamp=$(monotonic_millis) || return 1
   tmp="$DETAIL_FILE.tmp.${BASHPID:-$$}"
   umask 077
   {
@@ -3981,7 +4139,7 @@ begin_trial() {
   done
   if [ "$changed" = 1 ]; then HISTORY_SAMPLES=0; LAST_REASON=external_parameters_changed; return 1; fi
   [ "$HISTORY_SAMPLES" -ge 5 ] && [ "$CURRENT_DETAIL_VALID" = 1 ] || return 1
-  now=$(monotonic_millis)
+  now=$(monotonic_millis) || { LAST_REASON=metrics_unavailable; return 1; }
   [ "$LAST_REJECTED_GROUP" != "$reason" ] || [ $(( now - LAST_REJECTED_AT )) -ge 600000 ] || return 1
   BASE_ERROR="$HISTORY_ERROR"; BASE_RX="$HISTORY_RX"; BASE_TX="$HISTORY_TX"
   BASE_RTT=0; [ "$CURRENT_RTT_VALID" = 1 ] && BASE_RTT="$CURRENT_RTT_US"
@@ -4029,7 +4187,11 @@ begin_trial() {
   if [ "$ACTUATOR_CHANGED" -ne 1 ]; then
     _clear_trial_journal; LAST_REASON=actuator_unsupported; return 1
   fi
-  TRIAL_GROUP="$reason"; TRIAL_ACTIVE=1; TRIAL_STARTED=$(monotonic_millis)
+  TRIAL_GROUP="$reason"; TRIAL_ACTIVE=1
+  if ! TRIAL_STARTED=$(monotonic_millis); then
+    rollback_trial trial_invalid_sample || return 1
+    return 1
+  fi
   TRIAL_FIRST_WINDOW=1
   TRIAL_SAMPLES=0; TRIAL_ERROR_SUM=0; TRIAL_RX_SUM=0; TRIAL_TX_SUM=0
   TRIAL_ELAPSED_MS=0; TRIAL_RX_PPS_SUM=0; TRIAL_TX_PPS_SUM=0; TRIAL_KERNEL_SUM=0; TRIAL_SQUEEZE_SUM=0
@@ -4046,6 +4208,7 @@ metric_regressed() {
 evaluate_trial() {
   local now="${1:-$(monotonic_millis)}" avg_error avg_rx avg_tx total_base total_now avg_rx_pps avg_tx_pps avg_kernel avg_squeeze elapsed improved=0 context_status=0
   [ "$TRIAL_ACTIVE" -eq 1 ] || return 0
+  if [ "$now" -le 0 ] || [ "$now" -lt "$TRIAL_STARTED" ]; then rollback_trial trial_invalid_sample; return; fi
   _trial_parameters_match || context_status=$?
   if [ "$context_status" = 2 ]; then rollback_trial trial_parameters_unobservable; return; fi
   if [ "$context_status" = 3 ]; then rollback_trial external_parameters_changed; return; fi
@@ -4138,7 +4301,8 @@ evaluate_trial() {
 }
 
 write_state() {
-  local level="${1:-2}" reason="${2:-$LAST_REASON}" status="${3:-running}" tmp="$STATE_FILE.tmp.$$" name
+  local level="${1:-2}" reason="${2:-$LAST_REASON}" status="${3:-running}" tmp="$STATE_FILE.tmp.$$" name updated
+  printf -v updated '%(%F_%T)T' -1
   {
     printf 'STATUS=%q\nLEVEL=%q\nREASON=%q\n' "$status" "$level" "$reason"
     printf 'PPS=%q\nRX_PPS=%q\nTX_PPS=%q\nRX_BPS=%q\nTX_BPS=%q\n' "$CURRENT_PPS" "$CURRENT_RX_PPS" "$CURRENT_TX_PPS" "$CURRENT_RX_BPS" "$CURRENT_TX_BPS"
@@ -4152,20 +4316,36 @@ write_state() {
     printf 'METRICS_VALID=%q\nDETAIL_VALID=%q\nDRIVER_VALID=%q\nQDISC_VALID=%q\n' "$CURRENT_METRICS_VALID" "$CURRENT_DETAIL_VALID" "$CURRENT_DRIVER_VALID" "$CURRENT_QDISC_VALID"
     printf 'PRESSURE_SCORE=%q\nMACHINE=%q\n' "$CURRENT_PRESSURE_SCORE" "${CPU_COUNT}cpu/${PHYSICAL_COUNT}core/${MEM_KB}KiB/${NUMA_COUNT}numa/${RX_QUEUES}rxq"
     for name in "${PARAMETER_NAMES[@]}" ACTIVE_COALESCE ACTIVE_ADAPTIVE_RX ACTIVE_ADAPTIVE_TX TRIAL_STATUS TRIAL_GROUP VERIFICATION_SCOPE; do printf '%s=%q\n' "$name" "${!name}"; done
-    printf 'COOLDOWN_REMAINING=%q\nSAMPLE_SECONDS=%q\nUPDATED_AT=%q\n' "$CURRENT_COOLDOWN" "$INTERVAL" "$(date +%F_%T)"
+    printf 'COOLDOWN_REMAINING=%q\nSAMPLE_SECONDS=%q\nUPDATED_AT=%q\n' "$CURRENT_COOLDOWN" "$INTERVAL" "$updated"
   } > "$tmp" && mv -f "$tmp" "$STATE_FILE"
 }
+# The controller owns this log. Rename closed files instead of copying their
+# contents; retain two bounded archives without a logrotate/journald dependency.
 append_metric() {
-  local reason="${1:-$LAST_REASON}" now="${2:-0}" tmp="$METRICS_LOG.tmp.$$"
+  local reason="${1:-$LAST_REASON}" now="${2:-0}" line stamp size path LC_ALL=C
   [ $(( now - ${LAST_LOG_TS:-0} )) -ge 5000 ] || return 0
-  LAST_LOG_TS="$now"
-  printf '%s rx_pps=%s tx_pps=%s rx_bps=%s tx_bps=%s softirq=%s irq=%s steal=%s softnet=%s driver_rate=%s udp_rx=%s udp_tx=%s retrans_bp=%s qdisc_bytes=%s trial=%s scope=%s reason=%s\n' \
-    "$(date +%F_%T)" "$CURRENT_RX_PPS" "$CURRENT_TX_PPS" "$CURRENT_RX_BPS" "$CURRENT_TX_BPS" "$CURRENT_SOFTIRQ" "$CURRENT_HARDIRQ" "$CURRENT_STEAL" "$CURRENT_SOFT_DROPS" "$CURRENT_DRIVER_DROPS" "$CURRENT_UDP_RCVBUF" "$CURRENT_UDP_SNDBUF" "$CURRENT_RETRANS_BP" "$CURRENT_QDISC_BACKLOG" "$TRIAL_STATUS" "$VERIFICATION_SCOPE" "$reason" >> "$METRICS_LOG"
-  LOG_WINDOWS=$(( ${LOG_WINDOWS:-0} + 1 ))
-  if [ "$LOG_WINDOWS" -ge 120 ]; then
-    tail -n 10000 "$METRICS_LOG" > "$tmp" && mv -f "$tmp" "$METRICS_LOG"
-    LOG_WINDOWS=0
+  printf -v stamp '%(%F_%T)T' -1
+  printf -v line '%s rx_pps=%s tx_pps=%s rx_bps=%s tx_bps=%s softirq=%s irq=%s steal=%s softnet=%s driver_rate=%s udp_rx=%s udp_tx=%s retrans_bp=%s qdisc_bytes=%s trial=%s scope=%s reason=%s' \
+    "$stamp" "$CURRENT_RX_PPS" "$CURRENT_TX_PPS" "$CURRENT_RX_BPS" "$CURRENT_TX_BPS" "$CURRENT_SOFTIRQ" "$CURRENT_HARDIRQ" "$CURRENT_STEAL" "$CURRENT_SOFT_DROPS" "$CURRENT_DRIVER_DROPS" "$CURRENT_UDP_RCVBUF" "$CURRENT_UDP_SNDBUF" "$CURRENT_RETRANS_BP" "$CURRENT_QDISC_BACKLOG" "$TRIAL_STATUS" "$VERIFICATION_SCOPE" "$reason"
+  [ ! -L "$METRICS_LOG" ] && { [ ! -e "$METRICS_LOG" ] || [ -f "$METRICS_LOG" ]; } || return 1
+  # Refresh once a minute as well as at startup, so external rotation/truncation
+  # does not permanently invalidate the in-memory byte count.
+  if [ -z "${METRICS_BYTES:-}" ] || [ ! -f "$METRICS_LOG" ] || [ $(( now - ${METRICS_SIZE_TS:-0} )) -ge 60000 ]; then
+    size=0
+    if [ -f "$METRICS_LOG" ]; then size=$(stat -c %s "$METRICS_LOG" 2>/dev/null) || return 1; fi
+    case "$size" in ''|*[!0-9]*) return 1 ;; esac
+    METRICS_BYTES="$size"; METRICS_SIZE_TS="$now"
   fi
+  if [ $(( METRICS_BYTES + ${#line} + 1 )) -gt "$METRICS_MAX_BYTES" ]; then
+    for path in "$METRICS_LOG.1" "$METRICS_LOG.2"; do
+      [ ! -L "$path" ] && { [ ! -e "$path" ] || [ -f "$path" ]; } || return 1
+    done
+    if [ -f "$METRICS_LOG.1" ]; then mv -f "$METRICS_LOG.1" "$METRICS_LOG.2" || return 1; fi
+    if [ -f "$METRICS_LOG" ]; then mv -f "$METRICS_LOG" "$METRICS_LOG.1" || return 1; fi
+    METRICS_BYTES=0
+  fi
+  if ! printf '%s\n' "$line" >> "$METRICS_LOG"; then METRICS_BYTES=; return 1; fi
+  METRICS_BYTES=$(( METRICS_BYTES + ${#line} + 1 )); LAST_LOG_TS="$now"
 }
 release_lock() {
   local token= owner=
@@ -4181,7 +4361,7 @@ release_lock() {
     # This process created the baseline but was interrupted before it wrote metadata/applied anything.
     rm -f "$PENDING_FILE"
   fi
-  rm -f "$CPU_PREV_FILE" "$CPU_NOW_FILE"
+  CPU_PREVIOUS=
   rm -rf "$LOCK_DIR"
   if [ "${LOCK_METHOD:-}" = flock ]; then flock -u 9; exec 9>&-; fi
 }
@@ -4277,23 +4457,60 @@ calibrate() {
   TRIAL_STATUS=baseline; VERIFICATION_SCOPE=unverified
   write_state 2 calibrated
 }
+# Accept only decimal counters representable by Bash signed arithmetic. Keeping
+# raw strings until here avoids rounding long-lived NIC/SNMP counters in AWK.
+sample_uint() {
+  local value="$1" LC_ALL=C
+  case "$value" in ''|*[!0-9]*) REPLY=0; return 1 ;; esac
+  value="${value#"${value%%[!0]*}"}"; value="${value:-0}"
+  # Equal-length decimal strings are compared lexically before integer parsing.
+  # shellcheck disable=SC2071
+  if [ "${#value}" -gt 19 ] || { [ "${#value}" -eq 19 ] && [[ "$value" > 9223372036854775807 ]]; }; then REPLY=0; return 1; fi
+  REPLY="$value"
+}
 take_sample() {
-  local rx=-1 tx=-1 rb=-1 tb=-1 sd=0 sq=0 sv=0 rt=0 out=0 ui=0 ur=0 us=0 pv=0 ts valid=1
-  rx=$(read_counter "$SYS_ROOT/class/net/$DEV/statistics/rx_packets") || valid=0
-  tx=$(read_counter "$SYS_ROOT/class/net/$DEV/statistics/tx_packets") || valid=0
-  rb=$(read_counter "$SYS_ROOT/class/net/$DEV/statistics/rx_bytes") || valid=0
-  tb=$(read_counter "$SYS_ROOT/class/net/$DEV/statistics/tx_bytes") || valid=0
-  read -r sd sq sv < <(softnet_totals)
-  read -r rt out ui ur us pv < <(protocol_counters)
-  [ "$sv" = 1 ] && [ "$pv" = 1 ] || valid=0
-  ts=$(monotonic_millis)
+  local rx=0 tx=0 rb=0 tb=0 sd=0 sq=0 sv=0 rt=0 out=0 ui=0 ur=0 us=0 pv=0 ts=-1 valid=1 done=0
+  local name key raw tag a b c d e f g h j cpu_previous="${CPU_PREVIOUS:-}"
+  local -a nic=()
+  for name in rx_packets tx_packets rx_bytes tx_bytes; do
+    raw=
+    if ! read -r raw 2>/dev/null < "$SYS_ROOT/class/net/$DEV/statistics/$name"; then valid=0; fi
+    sample_uint "$raw" || valid=0
+    nic+=("$REPLY")
+  done
+  rx="${nic[0]}"; tx="${nic[1]}"; rb="${nic[2]}"; tb="${nic[3]}"
+  CPU_PREVIOUS=; SAMPLE_CPU_VALID=0
+  CURRENT_SOFTIRQ=0; CURRENT_STEAL=0; CURRENT_HARDIRQ=0; CURRENT_CPU_BUSY=0
+  while read -r tag a b c d e f g h j; do
+    case "$tag" in
+      C) CPU_PREVIOUS+="$a $b $c $d $e $f"$'\n' ;;
+      V) [ "$a" = 1 ] || CPU_PREVIOUS= ;;
+      U) CURRENT_SOFTIRQ="$a"; CURRENT_STEAL="$b"; CURRENT_HARDIRQ="$c"; CURRENT_CPU_BUSY="$d"; SAMPLE_CPU_VALID="$e" ;;
+      S) sd="$a"; sq="$b"; sv="$c" ;;
+      P)
+        pv="$j"
+        for key in a b c d e f g h; do
+          sample_uint "${!key}" || pv=0
+          printf -v "$key" '%s' "$REPLY"
+        done
+        rt="$a"; out="$b"; ui=$(( c + f )); ur=$(( d + g )); us=$(( e + h ))
+        [ "$ui" -ge 0 ] && [ "$ur" -ge 0 ] && [ "$us" -ge 0 ] || { ui=0; ur=0; us=0; pv=0; } ;;
+      T) ts="$a" ;;
+      END) done=1 ;;
+    esac
+  done < <(collect_metrics "$cpu_previous")
+  [ "$sv" = 1 ] && [ "$pv" = 1 ] && [ "$done" = 1 ] || valid=0
+  [ "$done" = 1 ] || CPU_PREVIOUS=
+  # Freeze at the previous monotonic sample on read failure. Mixing in epoch
+  # time would make recovery extend cooldowns by decades.
+  if [ "$ts" -lt 0 ]; then ts="${PREVIOUS_SAMPLE[11]:-0}"; valid=0; fi
   SAMPLE=("$rx" "$tx" "$rb" "$tb" "$sd" "$sq" "$rt" "$out" "$ui" "$ur" "$us" "$ts" "$valid")
 }
 collect_window() {
-  local elapsed i cpu_valid=0 sd_rate udp_rate
+  local elapsed i clock_valid=1 sd_rate udp_rate
   local -a delta=()
   take_sample
-  elapsed=$(( SAMPLE[11] - PREVIOUS_SAMPLE[11] )); [ "$elapsed" -gt 0 ] || elapsed=$(( INTERVAL * 1000 ))
+  elapsed=$(( SAMPLE[11] - PREVIOUS_SAMPLE[11] )); [ "$elapsed" -gt 0 ] || { elapsed=$(( INTERVAL * 1000 )); clock_valid=0; }
   CURRENT_METRICS_VALID=1; CURRENT_RESET=0; CURRENT_ELAPSED_MS="$elapsed"
   CURRENT_SAMPLE_START_MS="${PREVIOUS_SAMPLE[11]}"
   [ "${SAMPLE[12]}" = 1 ] && [ "${PREVIOUS_SAMPLE[12]}" = 1 ] || CURRENT_METRICS_VALID=0
@@ -4301,10 +4518,7 @@ collect_window() {
     delta[$i]=$(( SAMPLE[i] - PREVIOUS_SAMPLE[i] ))
     [ "${delta[$i]}" -ge 0 ] || { delta[$i]=0; CURRENT_RESET=1; }
   done
-  cpu_snapshot > "$CPU_NOW_FILE"
-  read -r CURRENT_SOFTIRQ CURRENT_STEAL CURRENT_HARDIRQ CURRENT_CPU_BUSY cpu_valid < <(cpu_window_pressure "$CPU_PREV_FILE" "$CPU_NOW_FILE")
-  [ "$cpu_valid" = 1 ] || CURRENT_METRICS_VALID=0
-  mv -f "$CPU_NOW_FILE" "$CPU_PREV_FILE"
+  [ "$SAMPLE_CPU_VALID" = 1 ] && [ "$clock_valid" = 1 ] || CURRENT_METRICS_VALID=0
   CURRENT_RX_PPS=$(( delta[0] * 1000 / elapsed )); CURRENT_TX_PPS=$(( delta[1] * 1000 / elapsed ))
   CURRENT_PPS=$(( CURRENT_RX_PPS + CURRENT_TX_PPS ))
   CURRENT_RX_BPS=$(( delta[2] * 8000 / elapsed )); CURRENT_TX_BPS=$(( delta[3] * 8000 / elapsed ))
@@ -4326,14 +4540,18 @@ collect_window() {
   PREVIOUS_SAMPLE=("${SAMPLE[@]}")
 }
 controller_loop() {
-  local now started last_detail=0 last_diag=0 pressure=0 reason group="" last_tick
+  local now started last_detail=0 last_diag=0 pressure=0 reason group="" last_tick tick_elapsed
   [[ "$DEV" =~ ^[a-zA-Z0-9_.:-]+$ ]] || { echo '无效网卡名称。' >&2; return 1; }
   calibrate || return 1
-  take_sample; PREVIOUS_SAMPLE=("${SAMPLE[@]}"); cpu_snapshot > "$CPU_PREV_FILE"
-  started=$(monotonic_millis); last_tick="$started"
+  take_sample; PREVIOUS_SAMPLE=("${SAMPLE[@]}")
+  started="${SAMPLE[11]}"; last_tick="$started"
   while sleep "$INTERVAL"; do
     collect_window; now="${SAMPLE[11]}"
-    CURRENT_COOLDOWN=$(( CURRENT_COOLDOWN - (now - last_tick) / 1000 )); [ "$CURRENT_COOLDOWN" -ge 0 ] || CURRENT_COOLDOWN=0
+    tick_elapsed=$(( now - last_tick ))
+    if [ "$tick_elapsed" -lt 0 ]; then
+      tick_elapsed=0; last_detail=0; last_diag=0; LAST_LOG_TS=0; METRICS_SIZE_TS=0
+    fi
+    CURRENT_COOLDOWN=$(( CURRENT_COOLDOWN - tick_elapsed / 1000 )); [ "$CURRENT_COOLDOWN" -ge 0 ] || CURRENT_COOLDOWN=0
     last_tick="$now"
     if [ $(( now - last_detail )) -ge $(( DETAIL_INTERVAL * 1000 )) ]; then launch_details "$now"; last_detail="$now"; fi
     read_detail_snapshot "$now"
@@ -4584,8 +4802,9 @@ write_auto_env() {
     printf 'MEMORY_KB=%q\nMEMORY_GB=%q\nNUMA_NODES=%q\n' "$memory_kb" "$(( (memory_kb + 1048575) / 1048576 ))" "$(numa_node_count)"
     printf 'RX_QUEUE_COUNT=%q\nNIC_DRIVER=%q\nNIC_SPEED_MBPS=%q\n' "$(nic_rx_queue_count "$nic")" "$(nic_driver_name "$nic")" "$(nic_speed_mbps "$nic")"
     printf 'AUTO_NIC_TUNING=%q\n' "$auto_nic"
-    for name in AUTO_INTERVAL AUTO_DETAIL_INTERVAL AUTO_DIAG_INTERVAL AUTO_UP_WINDOWS AUTO_COOLDOWN_SECONDS AUTO_WARMUP_SECONDS AUTO_TRIAL_SECONDS SOFTIRQ_HIGH STEAL_HIGH; do
+    for name in AUTO_INTERVAL AUTO_DETAIL_INTERVAL AUTO_DIAG_INTERVAL AUTO_UP_WINDOWS AUTO_COOLDOWN_SECONDS AUTO_WARMUP_SECONDS AUTO_TRIAL_SECONDS AUTO_METRICS_MAX_BYTES SOFTIRQ_HIGH STEAL_HIGH; do
       case "$name" in
+        AUTO_METRICS_MAX_BYTES) value="${AUTO_METRICS_MAX_BYTES:-2097152}" ;;
         AUTO_INTERVAL) value="${AUTO_INTERVAL:-1}" ;;
         AUTO_DETAIL_INTERVAL) value="${AUTO_DETAIL_INTERVAL:-10}" ;;
         AUTO_DIAG_INTERVAL) value="${AUTO_DIAG_INTERVAL:-30}" ;;
@@ -5247,6 +5466,10 @@ show_auto_status() {
     printf '%-24s %s KiB / %s pages\n' "可用内存/UDP池占用:" "${DIAG_MEM_AVAILABLE_KB:-unknown}" "${DIAG_UDP_MEM_PAGES:-unknown}"
     printf '%-24s %s / %s\n' "conntrack使用/上限:" "${DIAG_CONNTRACK_COUNT:-unknown}" "${DIAG_CONNTRACK_MAX:-unknown}"
     printf '%-24s %s / %s\n' "网卡/显式路由MTU:" "${DIAG_LINK_MTU:-unknown}" "${DIAG_ROUTE_MTU:-unknown}"
+    printf '%-24s %s / %s\n' "TCP算法/内核可用:" "${DIAG_CC_CURRENT:-unknown}" "${DIAG_CC_AVAILABLE:-unknown}"
+    printf '%-24s %s / %s\n' "RX/TX队列数:" "${DIAG_RX_QUEUES:-unknown}" "${DIAG_TX_QUEUES:-unknown}"
+    printf '%-24s %s / %s\n' "启用RPS/XPS的队列:" "${DIAG_RPS_ACTIVE_QUEUES:-unknown}" "${DIAG_XPS_ACTIVE_QUEUES:-unknown}"
+    printf '%-24s %s（仅检查挂载状态）\n' "XDP:" "${DIAG_XDP_STATUS:-unavailable}"
     printf '%-24s %s\n' "UDP批处理/GSO能力:" "${DIAG_APP_BATCH_STATUS:-unknown}"
     printf '%-24s %s\n' "代理pacing能力:" "${DIAG_APP_PACING_STATUS:-unknown}"
     printf '%-24s %s\n' "协议FEC能力:" "${DIAG_APP_FEC_STATUS:-unknown}"
