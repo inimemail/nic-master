@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="5.1.1-collector-review"
+VERSION="5.2.1-throughput-review"
 WORKDIR="/opt/live-relay-tuner"
 NIC_ENV_FILE="/etc/live-relay-nic.env"
 NIC_HELPER="/usr/local/sbin/live-relay-nic-apply.sh"
@@ -153,7 +153,7 @@ append_if_supported() {
 append_at_least_supported() {
   local key="$1" requested="$2" current
   case "$requested" in ''|*[!0-9]*) return 1 ;; esac
-  current=$(sysctl -n "$key" 2>/dev/null || true)
+  current=$(read_tuning_value "$key" || true)
   case "$current" in
     ''|*[!0-9]*) ;;
     *) [ "$current" -le "$requested" ] || requested="$current" ;;
@@ -299,22 +299,86 @@ collect_nic_irqs() {
   ' "$PROC_ROOT/interrupts" 2>/dev/null || true
 }
 
+# Validate before arithmetic; Linux buffer sysctls accept bounded integers.
+tuning_uint() {
+  local value="$1" maximum="$2" LC_ALL=C
+  case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  value="${value#"${value%%[!0]*}"}"; value="${value:-0}"
+  [ "${#value}" -le "${#maximum}" ] || return 1
+  # shellcheck disable=SC2071
+  if [ "${#value}" -eq "${#maximum}" ] && [[ "$value" > "$maximum" ]]; then return 1; fi
+  printf '%s\n' "$value"
+}
+
+read_tuning_value() {
+  local key="$1" value
+  if value=$(sysctl -n "$key" 2>/dev/null) && [ -n "$value" ]; then printf '%s\n' "$value"; return 0; fi
+  value=$(cat "${PROC_ROOT:-/proc}/sys/${key//.//}" 2>/dev/null) || return 1
+  [ -n "$value" ] && printf '%s\n' "$value"
+}
+
 calc_socket_buffer_max() {
-  local kb value
+  local kb value explicit rate rtt bdp key current low default high rest
   kb=$(mem_total_kb)
-  value=$(( kb * 1024 / 32 ))
-  [ "$value" -gt 268435456 ] && value=268435456
-  [ "$value" -lt 4194304 ] && value=4194304
-  echo "$value"
+  value=$(( kb * 1024 / 4 ))
+  if [ -n "${TCP_TARGET_MBPS:-}" ] || [ -n "${TCP_TARGET_RTT_MS:-}" ]; then
+    rate=$(tuning_uint "${TCP_TARGET_MBPS:-}" 1000000) && [ "$rate" -gt 0 ] &&
+    rtt=$(tuning_uint "${TCP_TARGET_RTT_MS:-}" 1000000) && [ "$rtt" -gt 0 ] || {
+      err 'TCP_TARGET_MBPS 与 TCP_TARGET_RTT_MS 必须同时为 1～1000000 的整数。' >&2; return 1;
+    }
+    # 2 * BDP = Mbps * RTT_ms * 250 bytes. No guess from NIC line speed.
+    bdp=$(( rate * rtt * 250 ))
+    [ "$value" -ge "$bdp" ] || value="$bdp"
+  fi
+  if [ -n "${TCP_BUFFER_MAX:-}" ]; then
+    explicit=$(tuning_uint "$TCP_BUFFER_MAX" 2147483647) && [ "$explicit" -gt 0 ] || {
+      err 'TCP_BUFFER_MAX 必须为 1～2147483647 字节。' >&2; return 1;
+    }
+    [ "$value" -ge "$explicit" ] || value="$explicit"
+  fi
+  [ "$value" -le 2147483647 ] || value=2147483647
+  # Keep a larger existing administrator/kernel ceiling, including procfs
+  # fallback when vendor sysctl cannot read an otherwise supported key.
+  for key in net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default net.ipv4.tcp_rmem net.ipv4.tcp_wmem; do
+    current=$(read_tuning_value "$key" || true)
+    case "$key" in
+      net.ipv4.tcp_*) read -r low default high rest <<< "$current"; current="${high:-}" ;;
+    esac
+    current=$(tuning_uint "$current" 2147483647) || continue
+    [ "$value" -ge "$current" ] || value="$current"
+  done
+  printf '%s\n' "$value"
 }
 
 calc_socket_buffer_default() {
-  local kb value
+  local kb value explicit
   kb=$(mem_total_kb)
-  value=$(( kb * 1024 / 4096 ))
-  [ "$value" -lt 262144 ] && value=262144
-  [ "$value" -gt 2097152 ] && value=2097152
-  echo "$value"
+  value=$(( kb * 1024 / 512 ))
+  [ "$value" -ge 262144 ] || value=262144
+  [ "$value" -le 8388608 ] || value=8388608
+  if [ -n "${SOCKET_BUFFER_DEFAULT:-}" ]; then
+    explicit=$(tuning_uint "$SOCKET_BUFFER_DEFAULT" 2147483647) && [ "$explicit" -gt 0 ] || {
+      err 'SOCKET_BUFFER_DEFAULT 必须为 1～2147483647 字节。' >&2; return 1;
+    }
+    [ "$value" -ge "$explicit" ] || value="$explicit"
+  fi
+  printf '%s\n' "$value"
+}
+
+append_buffer_triplet() {
+  local key="$1" minimum="$2" default="$3" maximum="$4" current low mid high extra candidate
+  current=$(read_tuning_value "$key" || true)
+  read -r low mid high extra <<< "$current"
+  local bound=2147483647
+  [ "$key" != net.ipv4.udp_mem ] || bound=9223372036854775807
+  if [ -z "$extra" ]; then
+    if candidate=$(tuning_uint "${low:-}" "$bound") && [ "$minimum" -lt "$candidate" ]; then minimum="$candidate"; fi
+    if candidate=$(tuning_uint "${mid:-}" "$bound") && [ "$default" -lt "$candidate" ]; then default="$candidate"; fi
+    if candidate=$(tuning_uint "${high:-}" "$bound") && [ "$maximum" -lt "$candidate" ]; then maximum="$candidate"; fi
+  fi
+  [ "$default" -ge "$minimum" ] || default="$minimum"
+  [ "$maximum" -ge "$default" ] || maximum="$default"
+  append_if_supported "$key" "$minimum $default $maximum"
 }
 
 current_cc_algo() {
@@ -480,19 +544,18 @@ calc_file_max() {
 }
 
 calc_udp_mem_pages() {
-  local kb page_size pages maximum pressure minimum
+  local kb page_size pages maximum pressure minimum percent
   kb=$(mem_total_kb)
   page_size=$(getconf PAGE_SIZE 2>/dev/null || echo 4096)
   case "$page_size" in ''|*[!0-9]*|0) page_size=4096 ;; esac
+  percent=$(tuning_uint "${UDP_MEMORY_PERCENT:-25}" 100) && [ "$percent" -gt 0 ] || {
+    err 'UDP_MEMORY_PERCENT 必须为 1～100。' >&2; return 1;
+  }
   pages=$(( kb * 1024 / page_size ))
-  # Budget the UDP protocol pool separately from each socket's ceiling.
-  # Actual allocation remains demand-driven; these are accounting thresholds.
-  maximum=$(( pages / 16 ))
-  [ "$maximum" -le $(( 2147483648 / page_size )) ] || maximum=$(( 2147483648 / page_size ))
-  [ "$maximum" -gt 0 ] || maximum=1
-  pressure=$(( maximum * 3 / 4 ))
-  minimum=$(( maximum / 2 ))
-  echo "$minimum $pressure $maximum"
+  maximum=$(( pages * percent / 100 ))
+  [ "$maximum" -gt 2 ] || maximum=3
+  pressure=$(( maximum * 3 / 4 )); minimum=$(( maximum / 2 ))
+  printf '%s %s %s\n' "$minimum" "$pressure" "$maximum"
 }
 
 calc_flow_limit_enabled() {
@@ -642,14 +705,6 @@ calc_tcp_max_tw_buckets() {
   echo "$target"
 }
 
-calc_tcp_notsent_lowat() {
-  local value="${TCP_NOTSENT_LOWAT:-131072}"
-  case "$value" in ''|*[!0-9]*) value=131072 ;; esac
-  [ "$value" -ge 16384 ] || value=16384
-  [ "$value" -le 524288 ] || value=524288
-  echo "$value"
-}
-
 calc_flow_limit_table_len() {
   local cpus
   cpus=$(online_cpu_count)
@@ -680,14 +735,23 @@ detect_primary_speed() {
 }
 
 append_common_sysctls() {
-  local cc="$1" lowat
-  lowat=$(calc_tcp_notsent_lowat)
+  local cc="$1" key name value
   append_if_supported net.core.default_qdisc fq || return 1
   append_if_supported net.ipv4.tcp_congestion_control "$cc" || return 1
 
   append_if_supported net.ipv4.tcp_mtu_probing 1 || return 1
   append_if_supported net.ipv4.tcp_slow_start_after_idle 0 || return 1
-  append_if_supported net.ipv4.tcp_notsent_lowat "$lowat" || return 1
+  for name in TCP_NOTSENT_LOWAT TCP_LIMIT_OUTPUT_BYTES; do
+    value="${!name:-keep}"
+    case "$value" in keep|auto|'') continue ;; esac
+    value=$(tuning_uint "$value" 4294967295) || { err "$name 无效，必须是 keep 或 0～4294967295。" >&2; return 1; }
+    case "$name" in
+      TCP_NOTSENT_LOWAT) key=net.ipv4.tcp_notsent_lowat ;;
+      TCP_LIMIT_OUTPUT_BYTES) key=net.ipv4.tcp_limit_output_bytes
+        [ "$value" -gt 0 ] || { err 'TCP_LIMIT_OUTPUT_BYTES 必须大于 0。' >&2; return 1; } ;;
+    esac
+    append_if_supported "$key" "$value" || return 1
+  done
   append_if_supported net.ipv4.tcp_fastopen 3 || return 1
   append_if_supported net.ipv4.ip_local_port_range "10000 65535" || return 1
 
@@ -717,10 +781,10 @@ append_hyper_sysctls() {
   budget_usecs=$(calc_netdev_budget_usecs "$speed" "$cpus")
   filemax=$(calc_file_max)
   flow_table_len=$(calc_flow_limit_table_len)
-  udp_mem=$(calc_udp_mem_pages)
+  udp_mem=$(calc_udp_mem_pages) || return 1
   mem_gb=$(mem_total_gb)
-  socket_max=$(calc_socket_buffer_max)
-  socket_default=$(calc_socket_buffer_default)
+  socket_max=$(calc_socket_buffer_max) || return 1
+  socket_default=$(calc_socket_buffer_default) || return 1
   tw_buckets=$(calc_tcp_max_tw_buckets)
 
   append_if_supported net.core.somaxconn "$somax" || return 1
@@ -741,18 +805,21 @@ append_hyper_sysctls() {
 
   append_at_least_supported fs.file-max "$filemax" || return 1
 
-  append_if_supported net.core.rmem_max "$socket_max" || return 1
-  append_if_supported net.core.wmem_max "$socket_max" || return 1
-  append_if_supported net.core.rmem_default "$socket_default" || return 1
-  append_if_supported net.core.wmem_default "$socket_default" || return 1
+  [ "$socket_max" -ge "$socket_default" ] || socket_max="$socket_default"
+  append_at_least_supported net.core.rmem_max "$socket_max" || return 1
+  append_at_least_supported net.core.wmem_max "$socket_max" || return 1
+  append_at_least_supported net.core.rmem_default "$socket_default" || return 1
+  append_at_least_supported net.core.wmem_default "$socket_default" || return 1
   append_if_supported net.core.optmem_max 262144 || return 1
 
-  append_if_supported net.ipv4.tcp_rmem "4096 $socket_default $socket_max" || return 1
-  append_if_supported net.ipv4.tcp_wmem "4096 $socket_default $socket_max" || return 1
-  append_if_supported net.ipv4.udp_mem "$udp_mem" || return 1
-  append_if_supported net.ipv4.udp_rmem_min 131072 || return 1
-
-  append_if_supported net.ipv4.tcp_limit_output_bytes 524288 || return 1
+  append_if_supported net.ipv4.tcp_moderate_rcvbuf 1 || return 1
+  append_buffer_triplet net.ipv4.tcp_rmem 4096 "$socket_default" "$socket_max" || return 1
+  append_buffer_triplet net.ipv4.tcp_wmem 4096 "$socket_default" "$socket_max" || return 1
+  local udp_low udp_pressure udp_high
+  read -r udp_low udp_pressure udp_high <<< "$udp_mem"
+  append_buffer_triplet net.ipv4.udp_mem "$udp_low" "$udp_pressure" "$udp_high" || return 1
+  append_at_least_supported net.ipv4.udp_rmem_min 131072 || return 1
+  append_at_least_supported net.ipv4.udp_wmem_min 131072 || return 1
 
 
 }
@@ -834,10 +901,67 @@ append_conntrack_sysctls() {
   done
 }
 
+profile_scalar_value() {
+  local profile="$1" key="$2"
+  [ -f "$profile" ] && [ ! -L "$profile" ] || return 1
+  awk -F= -v wanted="$key" '
+    /^[ \t]*[#;]/ {next}
+    NF==2 {k=$1;gsub(/[ \t]/,"",k);if(k==wanted){v=$2;gsub(/^[ \t]+|[ \t]+$/,"",v);n++}}
+    END {if(n==1 && v~/^[0-9]+$/)print v;else exit 1}' "$profile"
+}
+
+# Legacy successful installs may have no surviving original sysctl journal.
+# Never invent a default or scan failed transactions as an original baseline.
+append_legacy_sender_migration() {
+  local old="$1" destination="$2" key name legacy applied current original evidence
+  local journal="$WORKDIR/sysctl-before.env"
+  [ -f "$old" ] && [ ! -L "$old" ] || return 0
+  grep -q '^# Live Relay Tuner ' "$old" || return 0
+  for name in TCP_NOTSENT_LOWAT TCP_LIMIT_OUTPUT_BYTES; do
+    case "${!name:-auto}" in auto|'') ;; *) continue ;; esac
+    case "$name" in
+      TCP_NOTSENT_LOWAT) key=net.ipv4.tcp_notsent_lowat; legacy=131072 ;;
+      TCP_LIMIT_OUTPUT_BYTES) key=net.ipv4.tcp_limit_output_bytes; legacy=524288 ;;
+    esac
+    applied=$(profile_scalar_value "$old" "$key") || continue
+    [ "$applied" = "$legacy" ] || continue
+    current=$(read_tuning_value "$key" || true)
+    [ "$current" = "$applied" ] || continue
+    original=; evidence=
+    if [ -f "$journal" ] && [ ! -L "$journal" ]; then
+      evidence=$(profile_scalar_value "$journal.requested.conf" "$key" || true)
+      if [ "$evidence" = "$applied" ]; then
+        original=$(awk -F '\t' -v key="$key" '$1==key {v=$2;n++}END{if(n==1 && v~/^[0-9]+$/)print v}' "$journal") || return 1
+        original=$(tuning_uint "$original" 4294967295) || original=
+      fi
+    fi
+    if [ -n "$original" ] && { [ "$name" != TCP_LIMIT_OUTPUT_BYTES ] || [ "$original" -gt 0 ]; }; then
+      printf '# ONCE_RESTORE %s\n%s = %s\n' "$key" "$key" "$original" >> "$destination" || return 1
+      log "旧发送阈值 $key 将按可核对备份恢复为 $original；核验成功后移出持久化。" >&2
+    else
+      printf '# LEGACY_RETAINED %s = %s: original unavailable; explicit override supported\n' "$key" "$current" >> "$destination" || return 1
+      warn "旧发送阈值 $key=$current 没有可核对的原值，暂保留运行值；新配置不再强制覆盖，可用 $name 明确指定。" >&2
+    fi
+  done
+}
+
+finalize_sender_migration() {
+  local temporary
+  grep -q '^# ONCE_RESTORE ' "$SYSCTL_FILE" || return 0
+  temporary=$(mktemp "$SYSCTL_FILE.finalize.XXXXXX") || return 1
+  if ! awk '
+    /^# ONCE_RESTORE net[.]ipv4[.]tcp_(notsent_lowat|limit_output_bytes)$/ {key=$3;next}
+    {if(key!=""){k=$0;sub(/=.*/,"",k);gsub(/[ \t]/,"",k);if(k==key){key="";next}if($0!~/^#/)key=""}print}
+    ' "$SYSCTL_FILE" > "$temporary" || ! chmod 0644 "$temporary" || ! mv -f "$temporary" "$SYSCTL_FILE"; then
+    rm -f "$temporary"; return 1
+  fi
+}
+
 write_profile_2() {
   local cc="$1" target="$SYSCTL_FILE" temporary
   temporary=$(mktemp "$SYSCTL_FILE.build.XXXXXX") || return 1
   if ! write_profile_2_to "$temporary" "$cc"; then rm -f "$temporary"; return 1; fi
+  append_legacy_sender_migration "$target" "$temporary" || { rm -f "$temporary"; return 1; }
   chmod 0644 "$temporary" || { rm -f "$temporary"; return 1; }
   mv -f "$temporary" "$target" || return 1
 }
@@ -943,7 +1067,7 @@ apply_sysctl_file() {
   local temporary
   temporary=$(mktemp "$SYSCTL_FILE.apply.XXXXXX") || return 1
   cp "$prepared" "$temporary" && chmod 0644 "$temporary" && mv -f "$temporary" "$SYSCTL_FILE" || { rm -f "$temporary"; return 1; }
-  if apply_sysctl_file_impl; then return 0; fi
+  if apply_sysctl_file_impl && finalize_sender_migration; then return 0; fi
   if restore_sysctl_values "$journal"; then
     warn "sysctl 配置未完整通过，已恢复应用前的参数。"
   else
@@ -1741,8 +1865,23 @@ _calc_auto_queue_base() {
 _pick_target_queues() {
   local target auto max_combined workers current
   workers="${#WORKER_CPUS[@]}"
-  target="${TARGET_QUEUES:-auto}"
+  target="${TARGET_QUEUES:-throughput}"
   case "$target" in
+    keep)
+      current=$(_get_current_combined || true)
+      [[ "$current" =~ ^[1-9][0-9]*$ ]] && { printf '%s\n' "$current"; return 0; }
+      target=$(_calc_auto_queue_base || echo 1) ;;
+    throughput)
+      current=$(_get_current_combined || true)
+      if [ "${ALLOW_NIC_RECONFIGURE:-1}" != 1 ]; then
+        [[ "$current" =~ ^[1-9][0-9]*$ ]] && { printf '%s\n' "$current"; return 0; }
+      fi
+      target="${#WORKER_PRIMARY_CPUS[@]}"; [ "$target" -gt 0 ] || target="$workers"
+      case "${EFFECTIVE_CPUS:-}" in ''|*[!0-9]*|0) ;; *) [ "$target" -le "$EFFECTIVE_CPUS" ] || target="$EFFECTIVE_CPUS" ;; esac
+      max_combined=$(_get_max_combined || true)
+      if [[ "$max_combined" =~ ^[1-9][0-9]*$ ]] && [ "$target" -gt "$max_combined" ]; then target="$max_combined"; fi
+      # Expanding useful parallelism must not shrink an existing queue layout.
+      if [[ "$current" =~ ^[1-9][0-9]*$ ]] && [ "$target" -lt "$current" ]; then target="$current"; fi ;;
     auto|'')
       # Changing channels can reset a live NIC. Preserve a readable current
       # configuration unless disruptive reconfiguration was explicitly enabled.
@@ -1779,6 +1918,23 @@ _build_irq_cpu_list() {
   fi
 }
 
+# A custom RSS mapping cannot be reconstructed by ethtool -X equal. Preserve
+# it during automatic expansion; explicit channel requests remain available.
+_rss_is_default() {
+  local queues="$1" table
+  table=$(ethtool -x "$DEV" 2>/dev/null) || return 1
+  printf '%s\n' "$table" | awk -v queues="$queues" '
+    /^[ \t]*[0-9]+:/ {
+      base=$1;sub(/:$/,"",base)
+      if(base+0!=n+0 || NF<2)bad=1
+      for(i=2;i<=NF;i++) {
+        if($i!~/^[0-9]+$/ || $i!=(base+i-2)%queues)bad=1
+        n++
+      }
+    }
+    END {exit !(n>0 && !bad)}'
+}
+
 _apply_queue_count() {
   local target="$1" max_combined before after cur changed=0
   case "$target" in ''|*[!0-9]*|0) target=1 ;; esac
@@ -1788,15 +1944,20 @@ _apply_queue_count() {
     if [[ "$max_combined" =~ ^[1-9][0-9]*$ ]] && [ "$target" -gt "$max_combined" ]; then
       target="$max_combined"
     fi
-    if [ "$before" != "$target" ]; then
-      if ethtool -L "$DEV" combined "$target" >/dev/null 2>&1; then
-        after=$(_get_current_combined || true)
-        if [[ "$before" =~ ^[1-9][0-9]*$ ]] && [[ "$after" =~ ^[1-9][0-9]*$ ]] && [ "$after" != "$before" ]; then
-          changed=1
-        fi
-      else
-        printf '网卡 %s 队列调整未应用，保留当前配置。\n' "$DEV" >&2
+    if [[ "$before" =~ ^[1-9][0-9]*$ ]] && [ "$before" != "$target" ]; then
+      if [ "${TARGET_QUEUES:-throughput}" = throughput ] &&
+         [[ "$before" =~ ^[1-9][0-9]*$ ]] && ! _rss_is_default "$before"; then
+        printf '网卡 %s RSS 为自定义或不可核验，保留 %s 个队列；可显式指定 TARGET_QUEUES。\n' "$DEV" "$before" >&2
+        printf '%s\n' "$before"; return 0
       fi
+      if ! ethtool -L "$DEV" combined "$target" >/dev/null 2>&1; then
+        printf '网卡 %s 队列调整返回失败，正在核对实际配置。\n' "$DEV" >&2
+      fi
+      after=$(_get_current_combined || true)
+      [[ "$after" =~ ^[1-9][0-9]*$ ]] || {
+        printf '网卡 %s 队列修改后无法读取状态，停止安装。\n' "$DEV" >&2; return 1;
+      }
+      [ "$after" = "$before" ] || changed=1
     fi
   fi
   # Preserve a pre-existing RSS indirection table on every ordinary reapply.
@@ -1814,9 +1975,9 @@ _apply_queue_count() {
 }
 
 _apply_max_rings() {
-  local ring_info rxmax txmax cur_rx cur_tx target_rx target_tx mode missed previous speed auto_cap
+  local ring_info rxmax txmax cur_rx cur_tx target_rx target_tx mode missed previous speed auto_cap memory queues cap rounded actual_rx actual_tx
   local -a args=()
-  mode="${RING_MODE:-auto}"
+  mode="${RING_MODE:-rx-throughput}"
   [ "${MAX_RINGS:-0}" != "1" ] || mode=throughput
   ring_info=$(ethtool -g "$DEV" 2>/dev/null) || { echo unsupported; return 0; }
   read -r rxmax txmax cur_rx cur_tx < <(printf '%s\n' "$ring_info" | awk '
@@ -1831,6 +1992,28 @@ _apply_max_rings() {
   case "$mode" in
     keep) _get_current_rings; return 0 ;;
     latency) target_rx=512; target_tx=512 ;;
+    rx-throughput)
+      if [ "${ALLOW_NIC_RECONFIGURE:-1}" = 1 ]; then
+        target_rx="$rxmax"
+        memory="${NIC_MEMORY_KB:-1048576}"
+        case "$memory" in ''|*[!0-9]*) memory=1048576 ;; esac
+        [ "${#memory}" -le 12 ] || memory=1048576
+        memory=$(( 10#$memory ))
+        queues=$(_get_current_combined || true)
+        case "$queues" in ''|*[!0-9]*|0)
+          queues=$(find "$SYS_ROOT/class/net/$DEV/queues" -maxdepth 1 -type d -name 'rx-*' 2>/dev/null | awk 'END {print NR+0}')
+          [ "$queues" -gt 0 ] || queues=1 ;;
+        esac
+        # Estimate 4 KiB per RX descriptor; reserve up to 1/8 effective RAM
+        # across queues. Real driver allocation differs; do not shrink rings.
+        cap=$(( memory * 1024 / 8 / queues / 4096 ))
+        if [ "$target_rx" -gt "$cap" ]; then
+          rounded=1
+          while [ $(( rounded * 2 )) -le "$cap" ]; do rounded=$(( rounded * 2 )); done
+          target_rx="$rounded"
+        fi
+        [ "$target_rx" -ge "$cur_rx" ] || target_rx="$cur_rx"
+      fi ;;
     throughput|max) target_rx="$rxmax"; target_tx="$txmax" ;;
     auto|'')
       # Keep the driver's RX baseline and TX depth. Grow RX moderately only
@@ -1853,18 +2036,36 @@ _apply_max_rings() {
       ;;
     *) printf '未知 ring 模式 %s，保留当前值。\n' "$mode" >&2 ;;
   esac
-  if [[ "${RX_RING_TARGET:-}" =~ ^[1-9][0-9]*$ ]]; then
+  local name requested
+  for name in RX_RING_TARGET TX_RING_TARGET; do
+    requested="${!name:-}"
+    [ -n "$requested" ] || continue
+    if ! [[ "$requested" =~ ^[1-9][0-9]*$ ]] || [ "${#requested}" -gt 9 ]; then
+      printf '%s 必须为 1～999999999 的整数。\n' "$name" >&2; return 1
+    fi
+  done
+  if [ -n "${RX_RING_TARGET:-}" ]; then
     target_rx="$RX_RING_TARGET"
     if [ "$mode" = auto ] && [ "$target_rx" -lt "$cur_rx" ]; then target_rx="$cur_rx"; fi
   fi
-  if [[ "${TX_RING_TARGET:-}" =~ ^[1-9][0-9]*$ ]]; then target_tx="$TX_RING_TARGET"; fi
+  if [ -n "${TX_RING_TARGET:-}" ]; then target_tx="$TX_RING_TARGET"; fi
   [ "$target_rx" -le "$rxmax" ] || target_rx="$rxmax"
   [ "$target_tx" -le "$txmax" ] || target_tx="$txmax"
-  if [ "$target_rx" -gt 0 ] && [ "$target_rx" != "$cur_rx" ]; then args+=(rx "$target_rx"); fi
-  if [ "$target_tx" -gt 0 ] && [ "$target_tx" != "$cur_tx" ]; then args+=(tx "$target_tx"); fi
+  # Do not mutate a field whose original value cannot be captured/restored.
+  if [ "$cur_rx" -gt 0 ] && [ "$target_rx" -gt 0 ] && [ "$target_rx" != "$cur_rx" ]; then args+=(rx "$target_rx"); fi
+  if [ "$cur_tx" -gt 0 ] && [ "$target_tx" -gt 0 ] && [ "$target_tx" != "$cur_tx" ]; then args+=(tx "$target_tx"); fi
   if [ "${#args[@]}" -gt 0 ]; then
     ethtool -G "$DEV" "${args[@]}" >/dev/null 2>&1 || \
       printf '网卡 %s ring 调整未应用，保留驱动实际值。\n' "$DEV" >&2
+    ring_info=$(ethtool -g "$DEV" 2>/dev/null) || return 1
+    read -r actual_rx actual_tx < <(printf '%s\n' "$ring_info" | awk '
+      /Current hardware settings:/ {s=1;next}
+      s&&$1=="RX:" {rx=$2}s&&$1=="TX:" {tx=$2}END{print rx+0,tx+0}')
+    if { [ "$cur_rx" -gt 0 ] && [ "$actual_rx" -le 0 ]; } ||
+       { [ "$cur_tx" -gt 0 ] && [ "$actual_tx" -le 0 ]; }; then return 1; fi
+    if [ "$actual_rx" != "$target_rx" ] || [ "$actual_tx" != "$target_tx" ]; then
+      printf '网卡 %s ring 实际 RX/TX=%s/%s，请求=%s/%s；按实际值运行。\n' "$DEV" "$actual_rx" "$actual_tx" "$target_rx" "$target_tx" >&2
+    fi
   fi
   _get_current_rings
 }
@@ -1958,11 +2159,10 @@ _force_fq_qdisc() {
 }
 
 _apply_offloads() {
-  local mode snapshot feature alias desired line current
-  mode="${TUNE_OFFLOADS:-auto}"
-  # Auto preserves an operator/driver's existing feature dependencies.
-  # Explicit tuning writes individual mutable features, never one all-or-none
-  # command whose first unsupported flag hides the remaining capabilities.
+  local mode snapshot feature alias desired line current actual result
+  mode="${TUNE_OFFLOADS:-on}"
+  # Explicit auto/keep retains the old conservative behavior. The installed
+  # throughput default enables supported mutable features one at a time.
   case "$mode" in 1|on|yes|true) : ;; *) return 0 ;; esac
   snapshot=$(ethtool -k "$DEV" 2>/dev/null) || return 0
   while read -r feature alias desired; do
@@ -1970,9 +2170,28 @@ _apply_offloads() {
     [ -n "$line" ] || continue
     [[ "$line" != *"[fixed]"* ]] || continue
     current=$(printf '%s\n' "$line" | awk -F': *' '{split($2,v," ");print v[1]}')
+    case "$current" in on|off) ;; *) continue ;; esac
     [ "$current" != "$desired" ] || continue
-    ethtool -K "$DEV" "$alias" "$desired" >/dev/null 2>&1 || \
-      printf '网卡 %s offload %s 未应用，保留实际值。\n' "$DEV" "$feature" >&2
+    if [ "${OFFLOAD_RESTORE_FEATURES+x}" = x ]; then
+      case " $OFFLOAD_RESTORE_FEATURES " in *" $feature "*) : ;; *)
+        printf '网卡 %s offload %s 缺少本次操作的可恢复原值，跳过修改。\n' "$DEV" "$feature" >&2
+        continue ;;
+      esac
+    fi
+    result=0
+    ethtool -K "$DEV" "$alias" "$desired" >/dev/null 2>&1 || result=$?
+    snapshot=$(ethtool -k "$DEV" 2>/dev/null) || {
+      printf '网卡 %s offload 修改后无法读取状态，停止并恢复安装前配置。\n' "$DEV" >&2; return 1;
+    }
+    actual=$(printf '%s\n' "$snapshot" | awk -F': *' -v key="$feature" '$1==key {split($2,v," ");print v[1];exit}')
+    if [ "$actual" != "$desired" ]; then
+      if [ "$actual" = "$current" ]; then
+        printf '网卡 %s offload %s 未生效（返回 %s），保留实际值 %s。\n' "$DEV" "$feature" "$result" "$actual" >&2
+      else
+        printf '网卡 %s offload %s 修改后状态异常，停止并恢复安装前配置。\n' "$DEV" "$feature" >&2
+        return 1
+      fi
+    fi
   done <<'EOF_OFFLOADS'
 rx-checksumming rx on
 tx-checksumming tx on
@@ -2226,10 +2445,10 @@ fi
 _build_worker_cpu_list
 [ "${#WORKER_CPUS[@]}" -gt 0 ] || { echo "未选出工作 CPU"; exit 1; }
 
-TARGET_QUEUES=$(_pick_target_queues)
-case "$TARGET_QUEUES" in ''|*[!0-9]*|0) TARGET_QUEUES=1 ;; esac
+REQUESTED_QUEUES=$(_pick_target_queues)
+case "$REQUESTED_QUEUES" in ''|*[!0-9]*|0) REQUESTED_QUEUES=1 ;; esac
 
-TARGET_QUEUES=$(_apply_queue_count "$TARGET_QUEUES")
+TARGET_QUEUES=$(_apply_queue_count "$REQUESTED_QUEUES")
 case "$TARGET_QUEUES" in ''|*[!0-9]*|0) TARGET_QUEUES=1 ;; esac
 
 _build_irq_cpu_list "$TARGET_QUEUES"
@@ -2342,6 +2561,27 @@ select_nic_noninteractive() {
   printf '%s\n' "$nic"
 }
 
+prepare_offload_restore_features() {
+  local baseline="${SNAPSHOT_DIR:-}/offloads.tsv" current temporary
+  [ -n "${SYSCTL_TRANSACTION_JOURNAL:-}" ] || return 0
+  current="${SYSCTL_TRANSACTION_JOURNAL%/*}/runtime/offloads.tsv"
+  [ -f "$baseline" ] && [ ! -L "$baseline" ] && [ -s "$current" ] && [ ! -L "$current" ] || return 0
+  temporary=$(mktemp "$baseline.merge.XXXXXX") || return 1
+  # A feature unreadable in an earlier release has never been changed by
+  # this guarded path. Save its first known pre-change state, retaining every
+  # original entry already recorded. The installation transaction backs up
+  # this entire snapshot before we extend it.
+  if ! awk -F '\t' '
+    NF!=2 || $1!~/^(rx-checksumming|tx-checksumming|scatter-gather|tcp-segmentation-offload|generic-segmentation-offload|generic-receive-offload|large-receive-offload)$/ || $2!~/^(on|off)$/ {bad=1;next}
+    FILENAME==ARGV[1] {if(old[$1]++)bad=1;value[$1]=$2;order[++n]=$1;next}
+    {if(now[$1]++)bad=1;if(!($1 in value)){value[$1]=$2;order[++n]=$1}}
+    END {if(bad)exit 1;for(i=1;i<=n;i++)print order[i] "\t" value[order[i]]}
+    ' "$baseline" "$current" > "$temporary" || ! chmod 0600 "$temporary" || ! mv -f "$temporary" "$baseline"; then
+    rm -f "$temporary"; return 1
+  fi
+  awk -F '\t' '{printf "%s%s",sep,$1;sep=" "}END{print ""}' "$current"
+}
+
 setup_mode2_persistence() {
   local nic="$1" service_started=0
   ensure_cmd ethtool || return 1
@@ -2352,16 +2592,18 @@ setup_mode2_persistence() {
 
   build_nic_helper || return 1
   build_nic_service || return 1
-  local temporary
+  local temporary offload_restore
+  offload_restore=$(prepare_offload_restore_features) || return 1
   temporary=$(mktemp "$NIC_ENV_FILE.build.XXXXXX") || return 1
   {
     printf 'DEV=%q\nTUNER_STATE_DIR=%q\nEFFECTIVE_CPUS=%q\n' "$nic" "$WORKDIR" "$(online_cpu_count)"
+    printf 'NIC_MEMORY_KB=%q\n' "$(mem_total_kb)"
     printf 'USE_HT=%q\n' "${USE_HT:-0}"
     printf 'WORKER_CPUS_TARGET=%q\n' "${WORKER_CPUS_TARGET:-local}"
-    printf 'TARGET_QUEUES=%q\n' "${TARGET_QUEUES:-auto}"
-    printf 'ALLOW_NIC_RECONFIGURE=%q\n' "${ALLOW_NIC_RECONFIGURE:-0}"
+    printf 'TARGET_QUEUES=%q\n' "${TARGET_QUEUES:-throughput}"
+    printf 'ALLOW_NIC_RECONFIGURE=%q\n' "${ALLOW_NIC_RECONFIGURE:-1}"
     printf 'MAX_RINGS=%q\n' "${MAX_RINGS:-0}"
-    printf 'RING_MODE=%q\n' "${RING_MODE:-auto}"
+    printf 'RING_MODE=%q\n' "${RING_MODE:-rx-throughput}"
     printf 'RX_RING_TARGET=%q\n' "${RX_RING_TARGET:-}"
     printf 'TX_RING_TARGET=%q\n' "${TX_RING_TARGET:-}"
     printf 'COALESCE_MODE=%q\n' "${COALESCE_MODE:-auto}"
@@ -2374,7 +2616,8 @@ setup_mode2_persistence() {
     printf 'IRQBALANCE_POLICY=%q\n' "${IRQBALANCE_POLICY:-auto}"
     printf 'FLOW_CONTROL_MODE=%q\n' "${FLOW_CONTROL_MODE:-keep}"
     printf 'FORCE_FQ=%q\n' "${FORCE_FQ:-1}"
-    printf 'TUNE_OFFLOADS=%q\n' "${TUNE_OFFLOADS:-auto}"
+    printf 'TUNE_OFFLOADS=%q\n' "${TUNE_OFFLOADS:-on}"
+    printf 'OFFLOAD_RESTORE_FEATURES=%q\n' "$offload_restore"
   } > "$temporary" || { rm -f "$temporary"; return 1; }
   chmod 0600 "$temporary" || { rm -f "$temporary"; return 1; }
   mv -f "$temporary" "$NIC_ENV_FILE" || return 1
@@ -2480,8 +2723,24 @@ show_installation_diagnostics() {
   fi
 }
 
+runtime_rss_equal() {
+  local nic="$1" queues="$2" table
+  [[ "$queues" =~ ^[1-9][0-9]*$ ]] || return 1
+  table=$(ethtool -x "$nic" 2>/dev/null) || return 1
+  printf '%s\n' "$table" | awk -v queues="$queues" '
+    /^[ \t]*[0-9]+:/ {
+      base=$1;sub(/:$/,"",base)
+      if(base+0!=n+0 || NF<2)bad=1
+      for(i=2;i<=NF;i++) {
+        if($i!~/^[0-9]+$/ || $i!=(base+i-2)%queues)bad=1
+        n++
+      }
+    }
+    END {exit !(n>0 && !bad)}'
+}
+
 capture_original_runtime() {
-  local nic="$1" root="${SNAPSHOT_DIR%/}" snapshot="$SNAPSHOT_DIR/runtime.env" stage backup="" irq path value name
+  local nic="$1" root="${SNAPSHOT_DIR%/}" snapshot="$SNAPSHOT_DIR/runtime.env" stage backup="" irq path value name combined rss_equal=0
   local proc_root="${PROC_ROOT:-/proc}" sys_root="${SYS_ROOT:-/sys}" complete=1
   # Earlier versions have no marker. Keep a complete legacy snapshot intact;
   # never replace an original baseline with a new, already-tuned baseline.
@@ -2505,11 +2764,13 @@ capture_original_runtime() {
     fi
   done
   if [ ! -f "$stage/runtime.env" ]; then
+    combined=$(ethtool -l "$nic" 2>/dev/null | awk '/Current hardware settings:/ {s=1; next} s && /Combined:/ {print $2; exit}' || true)
+    runtime_rss_equal "$nic" "$combined" && rss_equal=1
     {
       printf 'ORIGINAL_NIC=%q\n' "$nic"
       printf 'IRQBALANCE_ENABLED=%q\n' "$(systemctl is-enabled irqbalance 2>/dev/null || true)"
       printf 'IRQBALANCE_ACTIVE=%q\n' "$(systemctl is-active irqbalance 2>/dev/null || true)"
-      printf 'ORIGINAL_COMBINED=%q\n' "$(ethtool -l "$nic" 2>/dev/null | awk '/Current hardware settings:/ {s=1; next} s && /Combined:/ {print $2; exit}' || true)"
+      printf 'ORIGINAL_COMBINED=%q\nORIGINAL_RSS_EQUAL=%q\n' "$combined" "$rss_equal"
       printf 'ORIGINAL_RX_RING=%q\n' "$(ethtool -g "$nic" 2>/dev/null | awk '/Current hardware settings:/ {s=1; next} s && $1 == "RX:" {print $2; exit}' || true)"
       printf 'ORIGINAL_TX_RING=%q\n' "$(ethtool -g "$nic" 2>/dev/null | awk '/Current hardware settings:/ {s=1; next} s && $1 == "TX:" {print $2; exit}' || true)"
       printf 'ORIGINAL_RX_USECS=%q\n' "$(ethtool -c "$nic" 2>/dev/null | awk -F': ' '/rx-usecs:/ {print $2; exit}' || true)"
@@ -2582,12 +2843,12 @@ apply_performance_power_policy() {
 }
 
 restore_original_runtime() {
-  local snapshot="$SNAPSHOT_DIR/runtime.env" path value irq nic current output desired feature line old_rx old_tx adaptive_rx adaptive_tx failed=0 original key name
+  local snapshot="$SNAPSHOT_DIR/runtime.env" path value irq nic current output desired feature line old_rx old_tx adaptive_rx adaptive_tx failed=0 original key name alias owned_irqs
   local proc_root="${PROC_ROOT:-/proc}"
   local -a args=()
   [ -f "$snapshot" ] || return 0
   # Keep legacy snapshots readable without requiring fields added later.
-  local ORIGINAL_NIC="" ORIGINAL_COMBINED="" ORIGINAL_RX_RING="" ORIGINAL_TX_RING=""
+  local ORIGINAL_NIC="" ORIGINAL_COMBINED="" ORIGINAL_RX_RING="" ORIGINAL_TX_RING="" ORIGINAL_RSS_EQUAL=0
   local ORIGINAL_RX_USECS="" ORIGINAL_TX_USECS="" ORIGINAL_ADAPTIVE_RX="" ORIGINAL_ADAPTIVE_TX=""
   local ORIGINAL_PAUSE_RX="" ORIGINAL_PAUSE_TX="" ORIGINAL_RPS_SOCK_FLOW_ENTRIES="" ORIGINAL_FLOW_LIMIT_CPU_BITMAP=""
   local IRQBALANCE_ENABLED=unknown IRQBALANCE_ACTIVE=unknown
@@ -2604,10 +2865,24 @@ restore_original_runtime() {
         if [ "$current" != "$ORIGINAL_COMBINED" ]; then
           if ! [[ "$current" =~ ^[1-9][0-9]*$ ]]; then failed=1
           else
-          if ! ethtool -L "$nic" combined "$ORIGINAL_COMBINED" >/dev/null 2>&1; then failed=1; fi
-          current=$(ethtool -l "$nic" 2>/dev/null | awk '/Current hardware settings:/ {s=1;next}s&&/Combined:/ {print $2;exit}' || true)
-          [ "$current" = "$ORIGINAL_COMBINED" ] || failed=1
+            # Some drivers reject shrinking channels while RSS still points
+            # to queues that would disappear. Restore the verified original
+            # round-robin range first, then verify it again after the resize.
+            local rss_ready=1
+            if [ "$ORIGINAL_RSS_EQUAL" = 1 ] && [ "$current" -gt "$ORIGINAL_COMBINED" ] && ! runtime_rss_equal "$nic" "$ORIGINAL_COMBINED"; then
+              ethtool -X "$nic" equal "$ORIGINAL_COMBINED" >/dev/null 2>&1 || true
+              runtime_rss_equal "$nic" "$ORIGINAL_COMBINED" || { rss_ready=0; failed=1; }
+            fi
+            if [ "$rss_ready" = 1 ]; then
+              ethtool -L "$nic" combined "$ORIGINAL_COMBINED" >/dev/null 2>&1 || true
+              current=$(ethtool -l "$nic" 2>/dev/null | awk '/Current hardware settings:/ {s=1;next}s&&/Combined:/ {print $2;exit}' || true)
+              [ "$current" = "$ORIGINAL_COMBINED" ] || failed=1
+            fi
           fi
+        fi
+        if [ "$ORIGINAL_RSS_EQUAL" = 1 ] && [ "$current" = "$ORIGINAL_COMBINED" ] && ! runtime_rss_equal "$nic" "$ORIGINAL_COMBINED"; then
+          ethtool -X "$nic" equal "$ORIGINAL_COMBINED" >/dev/null 2>&1 || true
+          runtime_rss_equal "$nic" "$ORIGINAL_COMBINED" || failed=1
         fi
       fi
       args=()
@@ -2686,7 +2961,15 @@ restore_original_runtime() {
           current=$(printf '%s\n' "$line" | awk -F': *' '{split($2,v," ");print v[1]}')
           [ "$current" != "$value" ] || continue
           if [ -z "$line" ] || [[ "$line" == *"[fixed]"* ]]; then failed=1; continue; fi
-          ethtool -K "$nic" "$feature" "$value" >/dev/null 2>&1 || failed=1
+          # Use short -K aliases for compatibility with older ethtool. Newer
+          # versions (including 5.9) also accept the displayed group names.
+          case "$feature" in
+            rx-checksumming) alias=rx ;; tx-checksumming) alias=tx ;;
+            scatter-gather) alias=sg ;; tcp-segmentation-offload) alias=tso ;;
+            generic-segmentation-offload) alias=gso ;; generic-receive-offload) alias=gro ;;
+            large-receive-offload) alias=lro ;; *) failed=1; continue ;;
+          esac
+          ethtool -K "$nic" "$alias" "$value" >/dev/null 2>&1 || true
           current=$(ethtool -k "$nic" 2>/dev/null | awk -F': *' -v key="$feature" '$1==key {split($2,v," ");print v[1];exit}' || true)
           [ "$current" = "$value" ] || failed=1
         done < "$SNAPSHOT_DIR/offloads.tsv"
@@ -2694,11 +2977,19 @@ restore_original_runtime() {
     fi
   fi
   if [ -f "$SNAPSHOT_DIR/irq-affinity.tsv" ]; then
+    owned_irqs=""
+    [ -z "$nic" ] || owned_irqs=$(collect_nic_irqs "$nic" || true)
     while IFS=$'\t' read -r irq value; do
       case "$irq" in ''|*[!0-9]*) failed=1; continue ;; esac
       path="$proc_root/irq/$irq/smp_affinity_list"
       current=$(cat "$path" 2>/dev/null || true)
       [ "$current" != "$value" ] || continue
+      # A channel rebuild can release/reassign IRQ numbers. Never apply a
+      # saved affinity to an IRQ that now belongs to another device.
+      if ! printf '%s\n' "$owned_irqs" | awk -v irq="$irq" '$1==irq {found=1}END{exit !found}'; then
+        printf 'IRQ %s 当前不属于网卡 %s，未覆盖亲和性；恢复尚未确认。\n' "$irq" "$nic" >&2
+        failed=1; continue
+      fi
       if [ ! -w "$path" ] || ! printf '%s\n' "$value" > "$path" 2>/dev/null; then failed=1; continue; fi
       [ "$(cat "$path" 2>/dev/null || true)" = "$value" ] || failed=1
     done < "$SNAPSHOT_DIR/irq-affinity.tsv"
@@ -3527,7 +3818,7 @@ METRICS_MAX_BYTES=$(uint "${AUTO_METRICS_MAX_BYTES:-2097152}" 2097152 67108864)
 [ "$METRICS_MAX_BYTES" -ge 65536 ] || METRICS_MAX_BYTES=65536
 DETAIL_INTERVAL=$(uint "${AUTO_DETAIL_INTERVAL:-10}" 10 300); [ "$DETAIL_INTERVAL" -ge "$INTERVAL" ] || DETAIL_INTERVAL="$INTERVAL"
 DIAG_INTERVAL=$(uint "${AUTO_DIAG_INTERVAL:-30}" 30 3600); [ "$DIAG_INTERVAL" -ge "$DETAIL_INTERVAL" ] || DIAG_INTERVAL="$DETAIL_INTERVAL"
-UP_WINDOWS=$(uint "${AUTO_UP_WINDOWS:-3}" 3 60); [ "$UP_WINDOWS" -gt 0 ] || UP_WINDOWS=1
+UP_WINDOWS=$(uint "${AUTO_UP_WINDOWS:-2}" 2 60); [ "$UP_WINDOWS" -gt 0 ] || UP_WINDOWS=1
 COOLDOWN_SECONDS=$(uint "${AUTO_COOLDOWN_SECONDS:-120}" 120 3600)
 WARMUP_SECONDS=$(uint "${AUTO_WARMUP_SECONDS:-15}" 15 300)
 TRIAL_SECONDS=$(uint "${AUTO_TRIAL_SECONDS:-30}" 30 300); [ "$TRIAL_SECONDS" -ge 5 ] || TRIAL_SECONDS=5
@@ -4540,7 +4831,7 @@ collect_window() {
   PREVIOUS_SAMPLE=("${SAMPLE[@]}")
 }
 controller_loop() {
-  local now started last_detail=0 last_diag=0 pressure=0 reason group="" last_tick tick_elapsed
+  local now started last_detail=0 last_diag=0 pressure=0 reason group="" pressure_group="" last_tick tick_elapsed
   [[ "$DEV" =~ ^[a-zA-Z0-9_.:-]+$ ]] || { echo '无效网卡名称。' >&2; return 1; }
   calibrate || return 1
   take_sample; PREVIOUS_SAMPLE=("${SAMPLE[@]}")
@@ -4602,6 +4893,8 @@ controller_loop() {
         reason=retransmission_observed
       fi
       if [ -n "$group" ]; then
+        [ "$pressure_group" = "$group" ] || pressure=0
+        pressure_group="$group"
         pressure=$(( pressure + 1 ))
         if [ "$pressure" -ge "$UP_WINDOWS" ]; then
           if begin_trial "$group"; then reason=trial_started; else reason=bounded_hold; fi
@@ -4808,7 +5101,7 @@ write_auto_env() {
         AUTO_INTERVAL) value="${AUTO_INTERVAL:-1}" ;;
         AUTO_DETAIL_INTERVAL) value="${AUTO_DETAIL_INTERVAL:-10}" ;;
         AUTO_DIAG_INTERVAL) value="${AUTO_DIAG_INTERVAL:-30}" ;;
-        AUTO_UP_WINDOWS) value="${AUTO_UP_WINDOWS:-3}" ;;
+        AUTO_UP_WINDOWS) value="${AUTO_UP_WINDOWS:-2}" ;;
         AUTO_COOLDOWN_SECONDS) value="${AUTO_COOLDOWN_SECONDS:-120}" ;;
         AUTO_WARMUP_SECONDS) value="${AUTO_WARMUP_SECONDS:-15}" ;;
         AUTO_TRIAL_SECONDS) value="${AUTO_TRIAL_SECONDS:-30}" ;;
