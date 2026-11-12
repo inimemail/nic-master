@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="5.0.2-compatible-status"
+VERSION="5.0.3-hyphen-sysctl"
 WORKDIR="/opt/live-relay-tuner"
 NIC_ENV_FILE="/etc/live-relay-nic.env"
 NIC_HELPER="/usr/local/sbin/live-relay-nic-apply.sh"
@@ -825,7 +825,8 @@ capture_sysctl_values() {
     line="${line#"${line%%[![:space:]]*}"}"
     case "$line" in ''|'#'*|';'*) printf '%s\n' "$line" >> "$temporary" || return 1; continue ;; esac
     key="${line%%=*}"; key="${key//[[:space:]]/}"
-    if [[ "$line" != *=* ]] || ! [[ "$key" =~ ^[a-zA-Z0-9_.]+$ ]]; then
+    # Hyphenated names such as fs.file-max are valid sysctl keys.
+    if [[ "$line" != *=* ]] || ! [[ "$key" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
       printf 'FAILED line=%s reason=invalid-profile-line\n' "$number" >> "$SYSCTL_PREFLIGHT_LOG"
       err "sysctl 配置第 $number 行格式无效；详情：$SYSCTL_PREFLIGHT_LOG"
       rm -f "$temporary" "$journal_tmp"; return 1
@@ -868,7 +869,7 @@ restore_sysctl_values() {
   mapfile -t records < "$journal"
   for ((i=${#records[@]}-1;i>=0;i--)); do
     line="${records[$i]}"; key="${line%%$'\t'*}"; value="${line#*$'\t'}"
-    [[ "$key" =~ ^[a-zA-Z0-9_.]+$ ]] && [ "$key" != "$line" ] || { failed=1; continue; }
+    [[ "$key" =~ ^[a-zA-Z0-9_.-]+$ ]] && [ "$key" != "$line" ] || { failed=1; continue; }
     actual=$(read_sysctl_original "$key" "$(sysctl_proc_path "$key")" | awk '{$1=$1;print}') || actual=""
     [ "$actual" != "$value" ] || continue
     sysctl -q -w "$key=$value" >/dev/null 2>&1 || true
@@ -1023,7 +1024,7 @@ restore_journal() {
   # Validate the entire journal before any restoration write.
   for entry in "${records[@]}"; do
     key="${entry%%$'\t'*}"; value="${entry#*$'\t'}"
-    [[ "$key" =~ ^[A-Za-z0-9_.]+$ ]] && [ "$entry" != "$key" ] && [ -n "$value" ] || return 1
+    [[ "$key" =~ ^[A-Za-z0-9_.-]+$ ]] && [ "$entry" != "$key" ] && [ -n "$value" ] || return 1
     restore_keys+=("$key"); restore_values+=("$value")
   done
   for ((i=${#restore_keys[@]}-1;i>=0;i--)); do
@@ -1097,7 +1098,7 @@ while IFS= read -r line || [ -n "$line" ]; do
   key="${line%%=*}"; value="${line#*=}"
   key="${key//[[:space:]]/}"
   value=$(printf '%s\n' "$value" | normalize)
-  [[ "$key" =~ ^[A-Za-z0-9_.]+$ ]] && [ -n "$value" ] || { log_event 'PREPARE_FAILED invalid_key_or_value'; exit 1; }
+  [[ "$key" =~ ^[A-Za-z0-9_.-]+$ ]] && [ -n "$value" ] || { log_event 'PREPARE_FAILED invalid_key_or_value'; exit 1; }
   path="$PROC_ROOT/sys/${key//.//}"
   if [ ! -e "$path" ] || [ ! -r "$path" ] || [ ! -w "$path" ]; then log_event "SKIPPED $key unsupported-or-readonly"; continue; fi
   original=$(read_value "$key") || { log_event "PREPARE_FAILED $key unreadable"; exit 1; }
