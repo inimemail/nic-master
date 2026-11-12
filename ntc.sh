@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="5.0.1-reviewed-relay"
+VERSION="5.0.2-compatible-status"
 WORKDIR="/opt/live-relay-tuner"
 NIC_ENV_FILE="/etc/live-relay-nic.env"
 NIC_HELPER="/usr/local/sbin/live-relay-nic-apply.sh"
@@ -798,31 +798,81 @@ write_profile_2_to() {
   append_conntrack_sysctls hyper || return 1
 }
 
+read_sysctl_original() {
+  local key="$1" path="$2" raw=""
+  if raw=$(sysctl -n "$key" 2>> "$SYSCTL_PREFLIGHT_LOG") && [ -n "$raw" ]; then
+    printf '%s\n' "$raw"; return 0
+  fi
+  # procps/vendor sysctl can reject a key which is readable through procfs.
+  if raw=$(cat "$path" 2>> "$SYSCTL_PREFLIGHT_LOG") && [ -n "$raw" ]; then
+    printf 'FALLBACK %s source=procfs\n' "$key" >> "$SYSCTL_PREFLIGHT_LOG" || return 1
+    printf '%s\n' "$raw"; return 0
+  fi
+  return 1
+}
+
 capture_sysctl_values() {
-  local profile="$1" destination="$2" line key value path
-  : > "$destination" || return 1
+  local profile="$1" destination="$2" prepared="${3:-$2.profile}" line key value path
+  local temporary journal_tmp selected=0 skipped=0 number=0
+  SYSCTL_PREFLIGHT_LOG="${SYSCTL_PREFLIGHT_LOG:-$destination.log}"
+  SYSCTL_PREFLIGHT_SKIPPED=0
+  : > "$SYSCTL_PREFLIGHT_LOG" || { err "无法写入预检日志：$SYSCTL_PREFLIGHT_LOG"; return 1; }
+  : > "$destination" || { err "无法创建 sysctl 原值备份：$destination"; return 1; }
+  temporary=$(mktemp "$prepared.prepare.XXXXXX") || { err "无法创建待应用配置：$prepared"; return 1; }
+  journal_tmp=$(mktemp "$destination.prepare.XXXXXX") || { rm -f "$temporary"; return 1; }
   while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in ''|'#'*) continue ;; esac
+    number=$((number + 1)); line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in ''|'#'*|';'*) printf '%s\n' "$line" >> "$temporary" || return 1; continue ;; esac
     key="${line%%=*}"; key="${key//[[:space:]]/}"
-    [[ "$key" =~ ^[a-zA-Z0-9_.]+$ ]] || return 1
+    if [[ "$line" != *=* ]] || ! [[ "$key" =~ ^[a-zA-Z0-9_.]+$ ]]; then
+      printf 'FAILED line=%s reason=invalid-profile-line\n' "$number" >> "$SYSCTL_PREFLIGHT_LOG"
+      err "sysctl 配置第 $number 行格式无效；详情：$SYSCTL_PREFLIGHT_LOG"
+      rm -f "$temporary" "$journal_tmp"; return 1
+    fi
     path=$(sysctl_proc_path "$key")
-    [ -e "$path" ] && [ -w "$path" ] || continue
-    value=$(sysctl -n "$key" 2>/dev/null | awk '{$1=$1;print}') || return 1
-    [ -n "$value" ] || return 1
-    printf '%s\t%s\n' "$key" "$value" >> "$destination" || return 1
+    value=""
+    if [ ! -e "$path" ] || [ ! -w "$path" ]; then
+      printf 'SKIPPED %s reason=unsupported-or-read-only\n' "$key" >> "$SYSCTL_PREFLIGHT_LOG" || return 1
+    elif value=$(read_sysctl_original "$key" "$path") && [ -n "$value" ] && [[ "$value" != *$'\n'* ]]; then
+      value=$(printf '%s\n' "$value" | awk '{$1=$1;print}') || return 1
+      if [ -n "$value" ]; then
+        printf '%s\t%s\n' "$key" "$value" >> "$journal_tmp" || return 1
+        printf '%s\n' "$line" >> "$temporary" || return 1
+        selected=$((selected + 1)); continue
+      fi
+      printf 'SKIPPED %s reason=empty-original\n' "$key" >> "$SYSCTL_PREFLIGHT_LOG" || return 1
+    else
+      printf 'SKIPPED %s reason=original-unreadable-or-invalid\n' "$key" >> "$SYSCTL_PREFLIGHT_LOG" || return 1
+    fi
+    skipped=$((skipped + 1))
+    printf '# SKIPPED %s: no readable/writable restorable original\n' "$key" >> "$temporary" || return 1
+    warn "跳过 $key：无法确认可读、可写的原值，本项不调整。"
   done < "$profile"
+  if [ "$selected" = 0 ]; then
+    printf 'FAILED reason=no-restorable-parameters\n' >> "$SYSCTL_PREFLIGHT_LOG"
+    err "没有可安全调整的 sysctl 参数；详情：$SYSCTL_PREFLIGHT_LOG"
+    rm -f "$temporary" "$journal_tmp"; return 1
+  fi
+  mv -f "$journal_tmp" "$destination" || return 1
+  mv -f "$temporary" "$prepared" || return 1
+  SYSCTL_PREFLIGHT_SKIPPED="$skipped"
+  printf 'PREPARED selected=%s skipped=%s journal=%s profile=%s\n' "$selected" "$skipped" "$destination" "$prepared" >> "$SYSCTL_PREFLIGHT_LOG" || return 1
 }
 
 restore_sysctl_values() {
   local journal="$1" line key value actual i failed=0
+  local SYSCTL_PREFLIGHT_LOG="${SYSCTL_PREFLIGHT_LOG:-$journal.log}"
   local -a records=()
   [ -r "$journal" ] || return 1
   mapfile -t records < "$journal"
   for ((i=${#records[@]}-1;i>=0;i--)); do
     line="${records[$i]}"; key="${line%%$'\t'*}"; value="${line#*$'\t'}"
     [[ "$key" =~ ^[a-zA-Z0-9_.]+$ ]] && [ "$key" != "$line" ] || { failed=1; continue; }
+    actual=$(read_sysctl_original "$key" "$(sysctl_proc_path "$key")" | awk '{$1=$1;print}') || actual=""
+    [ "$actual" != "$value" ] || continue
     sysctl -q -w "$key=$value" >/dev/null 2>&1 || true
-    actual=$(sysctl -n "$key" 2>/dev/null | awk '{$1=$1;print}') || actual=""
+    actual=$(read_sysctl_original "$key" "$(sysctl_proc_path "$key")" | awk '{$1=$1;print}') || actual=""
     [ "$actual" = "$value" ] || failed=1
   done
   return "$failed"
@@ -830,7 +880,16 @@ restore_sysctl_values() {
 
 apply_sysctl_file() {
   local journal="${SYSCTL_TRANSACTION_JOURNAL:-$WORKDIR/sysctl-before.env}"
-  capture_sysctl_values "$SYSCTL_FILE" "$journal" || { err "无法保存 sysctl 原值，未应用配置。"; return 1; }
+  local requested="$journal.requested.conf" prepared="$journal.selected.conf"
+  local SYSCTL_PREFLIGHT_LOG="$journal.log"
+  cp -p "$SYSCTL_FILE" "$requested" || { err "无法保存待应用配置：$requested"; return 1; }
+  capture_sysctl_values "$requested" "$journal" "$prepared" || {
+    err "sysctl 预检未通过，未应用参数；详情：$SYSCTL_PREFLIGHT_LOG"; return 1;
+  }
+  # Persist exactly the subset whose previous values were safely captured.
+  local temporary
+  temporary=$(mktemp "$SYSCTL_FILE.apply.XXXXXX") || return 1
+  cp "$prepared" "$temporary" && chmod 0644 "$temporary" && mv -f "$temporary" "$SYSCTL_FILE" || { rm -f "$temporary"; return 1; }
   if apply_sysctl_file_impl; then return 0; fi
   if restore_sysctl_values "$journal"; then
     warn "sysctl 配置未完整通过，已恢复应用前的参数。"
@@ -843,7 +902,7 @@ apply_sysctl_file() {
 apply_sysctl_file_impl() {
   : > "$SYSCTL_LOG"
   local line key value expected actual path
-  local applied=0 normalized=0 skipped=0 failed=0 stack_failed=0
+  local applied=0 normalized=0 skipped="${SYSCTL_PREFLIGHT_SKIPPED:-0}" failed=0 stack_failed=0
   # Apply only our profile; replaying unrelated sysctl files can disrupt services.
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
@@ -860,7 +919,7 @@ apply_sysctl_file_impl() {
       continue
     fi
     if ! sysctl -w "$key=$value" >>"$SYSCTL_LOG" 2>&1; then
-      actual=$(sysctl -n "$key" 2>/dev/null | awk '{$1=$1; print}' || true)
+      actual=$(read_sysctl_original "$key" "$path" | awk '{$1=$1; print}' || true)
       if is_kernel_retained_sysctl "$key" "$actual"; then
         printf 'SKIPPED %s requested=%s actual=%s reason=kernel-rejected-retained\n' \
           "$key" "$value" "$actual" >> "$SYSCTL_LOG"
@@ -872,7 +931,7 @@ apply_sysctl_file_impl() {
       continue
     fi
     expected=$(printf '%s\n' "$value" | awk '{$1=$1; print}')
-    actual=$(sysctl -n "$key" 2>/dev/null | awk '{$1=$1; print}' || true)
+    actual=$(read_sysctl_original "$key" "$path" | awk '{$1=$1; print}' || true)
     if [ "$actual" = "$expected" ]; then
       applied=$(( applied + 1 ))
     elif is_kernel_retained_sysctl "$key" "$actual"; then
@@ -937,7 +996,14 @@ PENDING_FILE="$WORKDIR/sysctl-boot-pending"
 TRANSACTION_DIR=""; TRANSACTION_ACTIVE=0
 KEYS=(); VALUES=(); ORIGINALS=(); WRITTEN=()
 normalize() { awk '{$1=$1;print}'; }
-read_value() { sysctl -n "$1" 2>/dev/null | normalize; }
+read_value() {
+  local raw=""
+  if ! raw=$(sysctl -n "$1" 2>/dev/null) || [ -z "$raw" ]; then
+    raw=$(cat "$PROC_ROOT/sys/${1//.//}" 2>/dev/null) || return 1
+  fi
+  [ -n "$raw" ] && [[ "$raw" != *$'\n'* ]] || return 1
+  printf '%s\n' "$raw" | normalize
+}
 is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
 retained_budget() {
   [ "$1" = net.core.netdev_budget_usecs ] && is_uint "$2"
@@ -2276,13 +2342,108 @@ setup_mode2_persistence() {
 }
 
 detect_data_plane() {
-  local cached="" detected=""
+  local cached="" stamp="" now="" detected="" tcp=0 udp=0 forward=0
   if [ -r "$WORKDIR/diagnostics.env" ]; then
-    cached=$(awk -F= '$1=="DIAG_DATA_PLANE" {print $2; exit}' "$WORKDIR/diagnostics.env")
-    case "$cached" in *[!A-Za-z0-9_+/-]*|'') ;; *) printf '%s\n' "$cached"; return 0 ;; esac
+    cached=$(awk -F= '$1=="DIAG_DATA_PLANE" {print $2;exit}' "$WORKDIR/diagnostics.env")
+    stamp=$(awk -F= '$1=="DIAG_UPDATED_MONO" {print $2;exit}' "$WORKDIR/diagnostics.env")
+    now=$(awk '{print int($1)}' "${PROC_ROOT:-/proc}/uptime" 2>/dev/null || true)
+    case "$stamp:$now" in *[!0-9:]*|:*|*:) ;; *)
+      if [ "$now" -ge "$stamp" ] && [ $((now - stamp)) -le 90 ]; then
+        case "$cached" in Proxy-local/*|Proxy-other-netns*|Mixed/*|Forward/*|Forward-observed) printf '%s\n' "$cached"; return 0 ;; esac
+      fi ;;
+    esac
   fi
-  detected=$(ps -eo comm= 2>/dev/null | awk '{n=$1;sub(/^.*\//,"",n);if(n~/^(sing-box|xray|v2ray|realm|gost|hysteria2?|tuic(-server)?|ss-server|ssserver|haproxy|nginx|caddy)$/){print "Proxy/Protocols-unknown";exit}}' || true)
-  printf '%s\n' "${detected:-Unknown}"
+  detected=$(ps -eo comm= 2>/dev/null | awk '{n=$1;sub(/^.*\//,"",n);if(n~/^(sing-box|xray|v2ray|realm|gost|hysteria2?|tuic(-server)?|ss-server|ssserver|haproxy|nginx|caddy)([-_.].*)?$/){print "Proxy/Protocols-unknown";exit}}' || true)
+  if [ -n "$detected" ]; then printf '%s\n' "$detected"; return 0; fi
+  if command -v ss >/dev/null 2>&1; then
+    tcp=$(ss -H -ltn 2>/dev/null | awk 'END {print NR+0}' || echo 0)
+    udp=$(ss -H -lun 2>/dev/null | awk 'END {print NR+0}' || echo 0)
+  fi
+  [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)" != 1 ] || forward=1
+  case "$tcp" in ''|*[!0-9]*) tcp=0 ;; esac
+  case "$udp" in ''|*[!0-9]*) udp=0 ;; esac
+  if [ "$tcp" -gt 0 ] && [ "$udp" -gt 0 ]; then printf 'Listeners/TCP+UDP\n'
+  elif [ "$tcp" -gt 0 ]; then printf 'Listeners/TCP\n'
+  elif [ "$udp" -gt 0 ]; then printf 'Listeners/UDP\n'
+  elif [ "$forward" = 1 ]; then printf 'Forward-enabled\n'
+  else printf 'Unknown\n'; fi
+}
+
+data_plane_label() {
+  case "${1:-Unknown}" in
+    Proxy-local/*+Forward-observed|Proxy-other-netns+Forward-observed) printf '代理与转发混合业务\n' ;;
+    Proxy-local/TCP+UDP) printf '本机代理 · TCP/UDP\n' ;;
+    Proxy-local/TCP) printf '本机代理 · TCP\n' ;;
+    Proxy-local/UDP) printf '本机代理 · UDP\n' ;;
+    Proxy/Protocols-unknown|Proxy-local/Protocols-unknown) printf '已识别代理 · 协议待采集\n' ;;
+    Proxy-other-netns) printf '代理位于其他网络命名空间\n' ;;
+    Mixed/*) printf '代理与转发混合业务\n' ;;
+    Forward/*|Forward-observed) printf '已观测到转发业务\n' ;;
+    Listeners/TCP+UDP) printf 'TCP/UDP 监听 · 代理待识别\n' ;;
+    Listeners/TCP) printf 'TCP 监听 · 代理待识别\n' ;;
+    Listeners/UDP) printf 'UDP 监听 · 代理待识别\n' ;;
+    Forward-enabled) printf '已开启转发 · 业务待确认\n' ;;
+    *) printf '待识别\n' ;;
+  esac
+}
+
+installed_tuner_version() {
+  local value=""
+  if [ -r "$AUTO_ENV_FILE" ]; then
+    value=$(awk -F= '$1=="TUNER_VERSION" {print $2;exit}' "$AUTO_ENV_FILE")
+    if [[ "$value" =~ ^[0-9][A-Za-z0-9_.-]*$ ]]; then printf 'V%s\n' "${value%%-*}"; return 0; fi
+  fi
+  if [ -r "$AUTO_HELPER" ]; then
+    if grep -q '^DETAIL_FILE=' "$AUTO_HELPER"; then printf 'V5\n'
+    elif grep -q '^COOLDOWN_WINDOWS=' "$AUTO_HELPER"; then printf 'V4\n'
+    else printf '版本待识别\n'; fi
+  else printf '版本待识别\n'; fi
+}
+
+tuner_status_label() {
+  local active=0 installed=0 previous="" version
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet live-relay-auto-controller.service >/dev/null 2>&1; then active=1; fi
+  [ ! -x "$AUTO_HELPER" ] || installed=1
+  if [ -r "$WORKDIR/last-operation.env" ]; then
+    previous=$(awk -F= '$1=="OPERATION_STATUS" {print $2;exit}' "$WORKDIR/last-operation.env")
+  fi
+  if [ "$previous" = recovery_failed ] || [ -e "$WORKDIR/sysctl-boot-pending" ]; then printf '恢复待处理\n'; return; fi
+  if [ "$active" = 1 ]; then
+    version=$(installed_tuner_version)
+    if [ -e "$PAUSE_FILE" ]; then printf '已暂停（%s）\n' "$version"
+    elif [ "$previous" = failed_restored ]; then printf '运行中（%s，上次操作未完成）\n' "$version"
+    else printf '运行中（%s）\n' "$version"; fi
+  elif [ "$installed" = 1 ]; then
+    version=$(installed_tuner_version)
+    if [ "$previous" = failed_restored ]; then printf '已停止（%s，上次操作未完成）\n' "$version"
+    elif [ -e "$PAUSE_FILE" ]; then printf '已暂停（%s，服务未运行）\n' "$version"
+    else printf '已停止（%s）\n' "$version"; fi
+  elif [ "$previous" = failed_restored ]; then printf '安装未完成\n'
+  else printf '未安装\n'; fi
+}
+
+write_operation_result() {
+  local status="$1" transaction="$2" reason="$3" temporary
+  temporary=$(mktemp "$WORKDIR/.last-operation.XXXXXX") || return 1
+  {
+    printf 'OPERATION_STATUS=%q\nOPERATION_TRANSACTION=%q\nOPERATION_REASON=%q\n' "$status" "$transaction" "$reason"
+    printf 'OPERATION_VERSION=%q\nOPERATION_UPDATED_AT=%q\n' "$VERSION" "$(date +%F_%T)"
+  } > "$temporary" && chmod 0600 "$temporary" && mv -f "$temporary" "$WORKDIR/last-operation.env" || { rm -f "$temporary"; return 1; }
+}
+
+show_installation_diagnostics() {
+  local OPERATION_STATUS="" OPERATION_TRANSACTION="" OPERATION_REASON="" OPERATION_VERSION="" OPERATION_UPDATED_AT=""
+  [ -r "$WORKDIR/last-operation.env" ] || return 0
+  # This atomic mode-0600 file belongs to the root-owned state directory.
+  # shellcheck disable=SC1090
+  source "$WORKDIR/last-operation.env" || return 0
+  case "$OPERATION_STATUS" in failed_restored|recovery_failed|started) ;; *) return 0 ;; esac
+  printf '最近配置操作：%s / %s / %s\n' "$OPERATION_REASON" "$OPERATION_VERSION" "$OPERATION_UPDATED_AT"
+  printf '诊断目录：%s\n' "$OPERATION_TRANSACTION"
+  if [ -r "$OPERATION_TRANSACTION/sysctl.before.log" ]; then
+    printf 'sysctl 预检记录（最近 12 行）：\n'
+    tail -n 12 "$OPERATION_TRANSACTION/sysctl.before.log"
+  fi
 }
 
 capture_original_runtime() {
@@ -4435,6 +4596,7 @@ write_auto_env() {
   [ "$physical" -le "$cpus" ] || physical="$cpus"
   is_container && auto_nic=0
   {
+    printf 'TUNER_VERSION=%q\n' "$VERSION"
     printf 'DEV=%q\nWORKDIR=%q\nDIAG_HELPER=%q\n' "$nic" "$WORKDIR" "$DIAG_HELPER"
     printf 'DATA_PLANE=%q\nONLINE_CPUS=%q\nPHYSICAL_CORES=%q\n' "$(detect_data_plane)" "$cpus" "$physical"
     printf 'MEMORY_KB=%q\nMEMORY_GB=%q\nNUMA_NODES=%q\n' "$memory_kb" "$(( (memory_kb + 1048575) / 1048576 ))" "$(numa_node_count)"
@@ -4596,13 +4758,16 @@ rollback_configuration_transaction() {
   # the signal trap while the configuration lock remains held.
   local failed=0 i unit
   trap '' HUP INT TERM
-  stop_auto_controller_for_reconfigure || { err "控制器尚未停止，未并发覆盖配置；备份：$txn"; return 1; }
+  stop_auto_controller_for_reconfigure || {
+    write_operation_result recovery_failed "$txn" "控制器未确认停止，暂未覆盖配置" || true
+    err "控制器尚未停止，未并发覆盖配置；备份：$txn"; return 1;
+  }
   if [ "$files_saved" = 1 ]; then
     if [ "$systemd_available" = 1 ]; then
       for ((i=0;i<${#units[@]};i++)); do
         unit="${units[$i]}"
         # Disable new links while their unit files still exist.
-        if [ "${old_enabled[$i]}" = 0 ] && systemctl is-enabled --quiet "$unit"; then
+        if [ "${old_enabled[$i]}" = 0 ] && systemctl is-enabled --quiet "$unit" >/dev/null 2>&1; then
           systemctl disable "$unit" >/dev/null 2>&1 || failed=1
         fi
         if { [ "$unit" = live-relay-nic-tuning.service ] || { [ "$unit" != live-relay-auto-controller.service ] && [ "${old_active[$i]}" = 0 ]; }; } && systemctl is-active --quiet "$unit"; then
@@ -4615,7 +4780,7 @@ rollback_configuration_transaction() {
     if [ "$systemd_available" = 1 ] && [ "$failed" = 0 ]; then
       systemctl daemon-reload || failed=1
       for ((i=1;i<${#units[@]};i++)); do
-        if [ "$failed" = 0 ] && [ "${old_active[$i]}" = 1 ] && ! systemctl is-active --quiet "${units[$i]}"; then
+        if [ "$failed" = 0 ] && [ "${old_active[$i]}" = 1 ] && ! systemctl is-active --quiet "${units[$i]}" >/dev/null 2>&1; then
           if [ "${units[$i]}" = live-relay-sysctl.service ]; then
             # Its ExecStart takes this same configuration lock. Do not replay
             # a profile over the exact kernel-state restoration below.
@@ -4639,8 +4804,13 @@ rollback_configuration_transaction() {
       systemctl start live-relay-auto-controller.service >/dev/null 2>&1 || failed=1
     fi
   fi
-  if [ "$failed" = 0 ]; then warn "已恢复操作前配置，诊断记录保留在 $txn。"
-  else err "有恢复项尚未确认，控制器保持停止；完整备份保留在 $txn。"; fi
+  if [ "$failed" = 0 ]; then
+    write_operation_result failed_restored "$txn" "操作未完成，已恢复操作前配置" || warn "无法更新操作状态。"
+    warn "已恢复操作前配置，诊断记录保留在 $txn。"
+  else
+    write_operation_result recovery_failed "$txn" "部分恢复尚未确认" || true
+    err "有恢复项尚未确认，控制器保持停止；完整备份保留在 $txn。"
+  fi
   return "$failed"
 }
 
@@ -4671,18 +4841,24 @@ install_auto_tuning() {
     if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
       systemd_available=1
       for ((i=0;i<${#units[@]};i++)); do
-        if systemctl is-active --quiet "${units[$i]}"; then old_active[$i]=1; fi
-        if systemctl is-enabled --quiet "${units[$i]}"; then old_enabled[$i]=1; fi
+        if systemctl is-active --quiet "${units[$i]}" >/dev/null 2>&1; then old_active[$i]=1; fi
+        if systemctl is-enabled --quiet "${units[$i]}" >/dev/null 2>&1; then old_enabled[$i]=1; fi
       done
     fi
     txn=$(mktemp -d "$WORKDIR/install-transaction.XXXXXX") || return 1
     chmod 0700 "$txn" || return 1
     SYSCTL_TRANSACTION_JOURNAL="$txn/sysctl.before"
+    # Publish the real path before any fallible snapshot step. Even an empty
+    # journal exists, and diagnostics distinguish it from a completed capture.
+    : > "$SYSCTL_TRANSACTION_JOURNAL" || { err "无法创建恢复记录：$SYSCTL_TRANSACTION_JOURNAL"; return 1; }
+    printf 'PREPARE phase=not-started journal=%s\n' "$SYSCTL_TRANSACTION_JOURNAL" > "$SYSCTL_TRANSACTION_JOURNAL.log" || return 1
+    write_operation_result started "$txn" "正在准备配置" || return 1
     info "正在保存操作前状态并停止旧控制器..."
     trap 'rollback_configuration_transaction || true; exit 130' HUP INT TERM
     if ! stop_auto_controller_for_reconfigure; then
       trap - HUP INT TERM
       [ "${old_active[0]}" != 1 ] || systemctl start live-relay-auto-controller.service >/dev/null 2>&1 || true
+      write_operation_result failed_restored "$txn" "未能确认旧控制器停止，未开始修改配置" || true
       return 1
     fi
     if ! backup_installation_files "$txn"; then
@@ -4736,6 +4912,7 @@ install_auto_tuning() {
       rollback_configuration_transaction || true
       return 1
     fi
+    write_operation_result applied "$txn" "配置操作已完成" || warn "配置已完成，状态记录更新失败。"
     trap - HUP INT TERM
     case "$operation" in auto|profile) remove_hia_baseline || warn "旧 HIA 文件未能全部清除，请检查权限。" ;; esac
     rm -rf "$txn" || warn "调优已完成，临时备份清理失败：$txn"
@@ -5015,7 +5192,9 @@ show_status() {
 }
 
 show_auto_status() {
-  local service_status="未安装" pause_status="运行中" reason="未采集" nic="$(default_nic)" data_plane="$(detect_data_plane)"
+  local service_status pause_status="未运行" reason="未采集" nic="$(default_nic)" data_plane
+  service_status=$(tuner_status_label)
+  data_plane=$(data_plane_label "$(detect_data_plane)")
   local METRICS_VALID=0 DETAIL_VALID=0 DRIVER_VALID=0 QDISC_VALID=0 SAMPLE_SECONDS=1
   local RX_PPS=0 TX_PPS=0 RX_BPS=0 TX_BPS=0 SOFTIRQ_PCT=0 HARDIRQ_PCT=0 STEAL_PCT=0
   local DROP_DELTA=0 SQUEEZE_DELTA=0 DRIVER_DROP_RATE=0 UDP_RCVBUF_DELTA=0 UDP_SNDBUF_DELTA=0
@@ -5025,10 +5204,7 @@ show_auto_status() {
   local REASON=unknown MACHINE=unknown UPDATED_AT=unknown COOLDOWN_REMAINING=0
   if [ -r "$AUTO_ENV_FILE" ]; then source "$AUTO_ENV_FILE" || true; nic="${DEV:-$nic}"; fi
   if [ -r "$AUTO_STATE_FILE" ]; then source "$AUTO_STATE_FILE" || true; reason="$REASON"; fi
-  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet live-relay-auto-controller.service 2>/dev/null; then
-    service_status=active
-  elif [ -x "$AUTO_HELPER" ]; then service_status=inactive; fi
-  [ ! -e "$PAUSE_FILE" ] || pause_status="已暂停"
+  case "$service_status" in 运行中*) pause_status="正在观察" ;; 已暂停*) pause_status="已暂停" ;; esac
   case "$reason" in
     calibrated) reason="配置已校准，等待业务观察" ;;
     controller_started) reason="控制器启动" ;;
@@ -5056,9 +5232,10 @@ show_auto_status() {
     steady) reason="运行观察中" ;;
   esac
   echo
-  echo "============== V5 自适应调优状态 =============="
+  echo "============== 自适应调优状态 =============="
   printf '%-24s %s / %s\n' "控制器:" "$service_status" "$pause_status"
   printf '%-24s %s\n' "数据面:" "$data_plane"
+  show_installation_diagnostics
   printf '%-24s %s\n' "网卡:" "${nic:-unknown}"
   printf '%-24s %s\n' "资源模型:" "$MACHINE"
   printf '%-24s %s\n' "当前动作:" "$reason"
@@ -5298,13 +5475,10 @@ wait_for_main_menu() {
 }
 
 show_menu() {
-  local status="未安装" data_plane="$(detect_data_plane)" pause_label="暂停调优"
-  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet live-relay-auto-controller.service 2>/dev/null; then
-    status="运行中"
-  elif [ -x "$AUTO_HELPER" ]; then
-    status="已停止"
-  fi
-  [ -e "$PAUSE_FILE" ] && { status="已暂停"; pause_label="继续调优"; }
+  local status data_plane pause_label="暂停调优"
+  status=$(tuner_status_label)
+  data_plane=$(data_plane_label "$(detect_data_plane)")
+  [ ! -e "$PAUSE_FILE" ] || pause_label="继续调优"
   clear || true
   cat <<EOF_MENU
 ========================================================
